@@ -36,7 +36,8 @@ func Connect(user, host string, port int, auth AuthConfig) (*Client, error) {
 
 	if auth.Password != "" {
 		authMethods = append(authMethods, ssh.Password(auth.Password))
-		authMethods = append(authMethods, ssh.KeyboardInteractive(&keyboardInteractiveHandler{Password: auth.Password}.Challenge))
+		handler := &keyboardInteractiveHandler{Password: auth.Password}
+		authMethods = append(authMethods, ssh.KeyboardInteractive(handler.Challenge))
 	}
 
 	if len(authMethods) == 0 {
