@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 // Default returns a per-user socket path.
@@ -48,12 +47,12 @@ func Validate(socketPath string) error {
 		return fmt.Errorf("refusing to use %s: permissions are too broad (%#o)", socketPath, info.Mode().Perm())
 	}
 
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("failed to inspect owner for %s", socketPath)
+	uid, err := fileOwnerUID(info)
+	if err != nil {
+		return fmt.Errorf("failed to inspect owner for %s: %w", socketPath, err)
 	}
-	if int(stat.Uid) != os.Geteuid() {
-		return fmt.Errorf("refusing to use %s: owned by uid %d, expected %d", socketPath, stat.Uid, os.Geteuid())
+	if uid != currentUID() {
+		return fmt.Errorf("refusing to use %s: owned by uid %d, expected %d", socketPath, uid, currentUID())
 	}
 	return nil
 }
@@ -71,12 +70,12 @@ func RemoveIfOwnedSocket(socketPath string) error {
 		return fmt.Errorf("refusing to remove %s: existing path is not a unix socket", socketPath)
 	}
 
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return fmt.Errorf("failed to inspect owner for %s", socketPath)
+	uid, err := fileOwnerUID(info)
+	if err != nil {
+		return fmt.Errorf("failed to inspect owner for %s: %w", socketPath, err)
 	}
-	if int(stat.Uid) != os.Geteuid() {
-		return fmt.Errorf("refusing to remove %s: owned by uid %d, expected %d", socketPath, stat.Uid, os.Geteuid())
+	if uid != currentUID() {
+		return fmt.Errorf("refusing to remove %s: owned by uid %d, expected %d", socketPath, uid, currentUID())
 	}
 	return os.Remove(socketPath)
 }

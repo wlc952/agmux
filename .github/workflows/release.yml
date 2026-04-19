@@ -19,21 +19,27 @@ jobs:
           - goos: linux
             goarch: amd64
             archive: tar.gz
+            build_server: "true"
           - goos: linux
             goarch: arm64
             archive: tar.gz
+            build_server: "true"
           - goos: darwin
             goarch: amd64
             archive: tar.gz
+            build_server: "true"
           - goos: darwin
             goarch: arm64
             archive: tar.gz
+            build_server: "true"
           - goos: windows
             goarch: amd64
             archive: zip
+            build_server: "false"
           - goos: windows
             goarch: arm64
             archive: zip
+            build_server: "false"
 
     steps:
       - name: Checkout
@@ -50,6 +56,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           ARCHIVE: ${{ matrix.archive }}
+          BUILD_SERVER: ${{ matrix.build_server }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -65,7 +72,9 @@ jobs:
           mkdir -p "${workdir}"
 
           go build -trimpath -ldflags="-s -w -X main.version=${TAG}" -o "${workdir}/agmux${suffix}" ./cmd/agmux
-          go build -trimpath -ldflags="-s -w -X main.version=${TAG}" -o "${workdir}/agmux-server${suffix}" ./cmd/agmux-server
+          if [[ "$BUILD_SERVER" == "true" ]]; then
+            go build -trimpath -ldflags="-s -w -X main.version=${TAG}" -o "${workdir}/agmux-server${suffix}" ./cmd/agmux-server
+          fi
 
           if [[ "$ARCHIVE" == "zip" ]]; then
             (cd dist && zip -r "${asset_name}.zip" "${asset_name}")
