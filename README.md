@@ -209,22 +209,6 @@ agmux -v
 | `-get` | 下载模式 |
 | `-c command` | SFTP 命令（ls/mkdir/rm） |
 
-## 与 gssh 的关键差异
-
-| 方面 | gssh | agmux |
-|------|------|-------|
-| 认证 | TCP 无认证 | Unix socket 0600（仅 owner 可连接） |
-| 会话 ID | UUID[:8] 随机 | 命名会话（`-n production`） |
-| Disconnect | 关闭 SSH = 断开 | detach(保持) / kill(关闭) 语义分离 |
-| 本地执行 | 不支持 | `agmux local` + `agmux run` |
-| Sudo | shell 拼接密码（注入风险） | SUDO_ASKPASS 临时脚本（安全） |
-| 重连 | 固定 5 秒 | 指数退避 5s→10s→20s→...→5min |
-| 输出格式 | JSON-RPC 文本 | imsg 二进制帧 + JSON payload |
-| 命令包装 | needsShell 启发式 | 始终 `/bin/sh -c` 包装 |
-| 持久化 | 无 | `~/.agmux/state.json` |
-| 审计 | 无 | `~/.agmux/audit.log` |
-| 架构 | Manager 900行 God Object | 拆分为 5 个独立 Service |
-
 ## 项目结构
 
 ```
