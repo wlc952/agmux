@@ -34,6 +34,7 @@ type Server struct {
 	audit      *audit.Logger
 	wg         sync.WaitGroup
 	shutdown   chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewServer creates a new server instance.
@@ -46,13 +47,12 @@ func NewServer(socketPath string) *Server {
 		executor:   exec.NewExecutor(sessions),
 		forwards:   portforward.NewService(sessions),
 		transfer:   transfer.NewService(sessions),
-		reconnect:  reconnect.NewMonitor(sessions, portforward.NewService(sessions)),
 		persist:    persist.NewStore(),
 		audit:      audit.NewLogger(),
 		shutdown:   make(chan struct{}),
 	}
 
-	// Reconnect monitor uses the actual forwards service
+	// Reconnect monitor uses the actual forwards service.
 	s.reconnect = reconnect.NewMonitor(sessions, s.forwards)
 
 	return s
@@ -96,32 +96,35 @@ func (s *Server) Start() error {
 
 // Stop performs graceful shutdown.
 func (s *Server) Stop() error {
-	log.Println("[server] Shutting down...")
+	s.stopOnce.Do(func() {
+		log.Println("[server] Shutting down...")
 
-	close(s.shutdown)
+		close(s.shutdown)
 
-	// 1. Close listener
-	if s.listener != nil {
-		s.listener.Close()
-	}
+		// 1. Close listener
+		if s.listener != nil {
+			s.listener.Close()
+		}
 
-	// 2. Persist state
-	states := persist.CollectState(s.sessions.List())
-	if err := s.persist.Save(states); err != nil {
-		log.Printf("[server] Failed to persist state: %v", err)
-	}
+		// 2. Persist state
+		states := persist.CollectState(s.sessions.List())
+		if err := s.persist.Save(states); err != nil {
+			log.Printf("[server] Failed to persist state: %v", err)
+		}
 
-	// 3. Kill all sessions
-	s.sessions.KillAll()
+		// 3. Kill all sessions
+		s.sessions.KillAll()
 
-	// 4. Wait for goroutines
-	s.wg.Wait()
+		// 4. Wait for goroutines
+		s.wg.Wait()
 
-	// 5. Cleanup
-	os.Remove(s.socketPath)
-	s.audit.Close()
+		// 5. Cleanup
+		os.Remove(s.socketPath)
+		s.audit.Close()
 
-	log.Println("[server] Shutdown complete")
+		log.Println("[server] Shutdown complete")
+	})
+
 	return nil
 }
 
@@ -232,14 +235,10 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		}
 		result, err := s.executor.Exec(params.Name, params.Command, params.Timeout, &params.Sudo)
 		if err != nil {
-			s.audit.Log(audit.Entry{Session: params.Name, Action: "exec", Command: params.Command, Result: "error", Detail: err.Error()})
+			s.logExecAudit(params.Name, params.Command, err, nil)
 			return nil, err
 		}
-		resultStr := "success"
-		if result.ExitCode != 0 {
-			resultStr = fmt.Sprintf("exit_%d", result.ExitCode)
-		}
-		s.audit.Log(audit.Entry{Session: params.Name, Action: "exec", Command: params.Command, Result: resultStr})
+		s.logExecAudit(params.Name, params.Command, nil, result)
 		payload, _ := protocol.EncodePayload(result)
 		return imsg.NewImsg(protocol.MsgResult, payload), nil
 
@@ -250,14 +249,16 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		}
 		result, err := s.executor.ExecLocal(params.Command, params.Timeout, &params.Sudo)
 		if err != nil {
+			s.logExecAudit("", params.Command, err, nil)
 			return nil, err
 		}
+		s.logExecAudit("", params.Command, nil, result)
 		payload, _ := protocol.EncodePayload(result)
 		return imsg.NewImsg(protocol.MsgResult, payload), nil
 
 	case protocol.MsgList:
 		sessions := s.sessions.List()
-	 infos := make([]protocol.SessionInfo, len(sessions))
+		infos := make([]protocol.SessionInfo, len(sessions))
 		for i, sess := range sessions {
 			infos[i] = sessionToInfo(sess)
 		}
@@ -316,8 +317,10 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 			result, err = s.transfer.Download(params.Name, params.Source, params.Dest)
 		}
 		if err != nil {
+			s.logTransferAudit(params.Name, "scp", params.Source+" -> "+params.Dest, err, nil)
 			return nil, err
 		}
+		s.logTransferAudit(params.Name, "scp", params.Source+" -> "+params.Dest, nil, result)
 		payload, _ := protocol.EncodePayload(result)
 		return imsg.NewImsg(protocol.MsgResult, payload), nil
 
@@ -328,8 +331,10 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		}
 		files, err := s.transfer.ListDir(params.Name, params.Path)
 		if err != nil {
+			s.audit.Log(audit.Entry{Session: params.Name, Action: "sftp_ls", Command: params.Path, Result: "error", Detail: err.Error()})
 			return nil, err
 		}
+		s.audit.Log(audit.Entry{Session: params.Name, Action: "sftp_ls", Command: params.Path, Result: "success"})
 		payload, _ := protocol.EncodePayload(files)
 		return imsg.NewImsg(protocol.MsgResult, payload), nil
 
@@ -340,8 +345,10 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		}
 		err := s.transfer.Mkdir(params.Name, params.Path)
 		if err != nil {
+			s.audit.Log(audit.Entry{Session: params.Name, Action: "sftp_mkdir", Command: params.Path, Result: "error", Detail: err.Error()})
 			return nil, err
 		}
+		s.audit.Log(audit.Entry{Session: params.Name, Action: "sftp_mkdir", Command: params.Path, Result: "success"})
 		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"created"}`)), nil
 
 	case protocol.MsgSFTPRm:
@@ -351,8 +358,10 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		}
 		err := s.transfer.Remove(params.Name, params.Path)
 		if err != nil {
+			s.audit.Log(audit.Entry{Session: params.Name, Action: "sftp_rm", Command: params.Path, Result: "error", Detail: err.Error()})
 			return nil, err
 		}
+		s.audit.Log(audit.Entry{Session: params.Name, Action: "sftp_rm", Command: params.Path, Result: "success"})
 		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"removed"}`)), nil
 
 	case protocol.MsgReconnect:
@@ -382,6 +391,34 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 	default:
 		return nil, fmt.Errorf("unknown message type: %d", msg.Type)
 	}
+}
+
+func (s *Server) logExecAudit(sessionName, command string, err error, result *protocol.ExecResult) {
+	if err != nil {
+		s.audit.Log(audit.Entry{Session: sessionName, Action: "exec", Command: command, Result: "error", Detail: err.Error()})
+		return
+	}
+
+	resultStr := "success"
+	if result != nil && result.ExitCode != 0 {
+		resultStr = fmt.Sprintf("exit_%d", result.ExitCode)
+	}
+	s.audit.Log(audit.Entry{Session: sessionName, Action: "exec", Command: command, Result: resultStr})
+}
+
+func (s *Server) logTransferAudit(sessionName, action, command string, err error, result *protocol.TransferResult) {
+	if err != nil {
+		s.audit.Log(audit.Entry{Session: sessionName, Action: action, Command: command, Result: "error", Detail: err.Error()})
+		return
+	}
+
+	resultStr := "success"
+	detail := ""
+	if result != nil && !result.Success {
+		resultStr = "error"
+		detail = result.Message
+	}
+	s.audit.Log(audit.Entry{Session: sessionName, Action: action, Command: command, Result: resultStr, Detail: detail})
 }
 
 func sessionToInfo(sess session.Session) protocol.SessionInfo {

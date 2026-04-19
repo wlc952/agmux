@@ -32,6 +32,8 @@ type Forwarder struct {
 	mu          sync.RWMutex
 }
 
+type remoteListenerFactory func(client *ssh.Client, addr string) (net.Listener, error)
+
 // NewForwarder creates a new port forwarder.
 func NewForwarder(sshClient *ssh.Client, forwardType string, localPort, remotePort int) (*Forwarder, error) {
 	f := &Forwarder{
@@ -43,7 +45,8 @@ func NewForwarder(sshClient *ssh.Client, forwardType string, localPort, remotePo
 		conns:      make(map[net.Conn]bool),
 	}
 
-	if forwardType == "local" {
+	switch forwardType {
+	case "local":
 		addr := fmt.Sprintf("localhost:%d", localPort)
 		listener, err := net.Listen("tcp", addr)
 		if err != nil {
@@ -51,30 +54,33 @@ func NewForwarder(sshClient *ssh.Client, forwardType string, localPort, remotePo
 		}
 		f.listener = listener
 		log.Printf("[portforward] Local forward: localhost:%d -> remote:%d", localPort, remotePort)
-	} else if forwardType == "remote" {
+	case "remote":
 		log.Printf("[portforward] Remote forward: remote:%d -> localhost:%d", remotePort, localPort)
+	default:
+		return nil, fmt.Errorf("invalid forward type: %s", forwardType)
 	}
 
 	return f, nil
 }
 
 // Start begins accepting connections for the forwarder.
-func (f *Forwarder) Start() {
+func (f *Forwarder) Start() error {
 	f.lifecycleMu.Lock()
 	defer f.lifecycleMu.Unlock()
 
 	f.mu.RLock()
 	if f.closed {
 		f.mu.RUnlock()
-		return
+		return fmt.Errorf("forwarder is closed")
 	}
 	f.mu.RUnlock()
 
 	if f.Type == "local" {
 		f.startLocalForward()
-	} else if f.Type == "remote" {
-		f.startRemoteForward()
+		return nil
 	}
+
+	return f.startRemoteForward(defaultRemoteListenerFactory)
 }
 
 func (f *Forwarder) startLocalForward() {
@@ -161,32 +167,30 @@ func (f *Forwarder) handleLocalConnection(localConn net.Conn) {
 	<-done
 }
 
-func (f *Forwarder) startRemoteForward() {
+func (f *Forwarder) startRemoteForward(factory remoteListenerFactory) error {
+	f.mu.RLock()
+	client := f.sshClient
+	f.mu.RUnlock()
+
+	if client == nil {
+		return fmt.Errorf("SSH client is nil, cannot start remote forward")
+	}
+
+	remoteAddr := fmt.Sprintf("0.0.0.0:%d", f.RemotePort)
+	listener, err := factory(client, remoteAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on remote port %d: %w", f.RemotePort, err)
+	}
+
+	f.mu.Lock()
+	f.listener = listener
+	f.mu.Unlock()
+
+	log.Printf("[portforward] Remote forward: listening on port %d", f.RemotePort)
+
 	f.wg.Add(1)
 	go func() {
 		defer f.wg.Done()
-
-		f.mu.RLock()
-		client := f.sshClient
-		f.mu.RUnlock()
-
-		if client == nil {
-			log.Printf("[portforward] SSH client is nil, cannot start remote forward")
-			return
-		}
-
-		remoteAddr := fmt.Sprintf("0.0.0.0:%d", f.RemotePort)
-		listener, err := client.Listen("tcp", remoteAddr)
-		if err != nil {
-			log.Printf("[portforward] Failed to listen on remote port %d: %v", f.RemotePort, err)
-			return
-		}
-
-		f.mu.Lock()
-		f.listener = listener
-		f.mu.Unlock()
-
-		log.Printf("[portforward] Remote forward: listening on port %d", f.RemotePort)
 
 		for {
 			f.mu.RLock()
@@ -244,6 +248,8 @@ func (f *Forwarder) startRemoteForward() {
 			}()
 		}
 	}()
+
+	return nil
 }
 
 // Close shuts down the forwarder.
@@ -310,7 +316,9 @@ func (f *Forwarder) Restart(sshClient *ssh.Client) {
 	if f.Type == "local" {
 		f.startLocalForward()
 	} else if f.Type == "remote" {
-		f.startRemoteForward()
+		if err := f.startRemoteForward(defaultRemoteListenerFactory); err != nil {
+			log.Printf("[portforward] Failed to restart remote forward: %v", err)
+		}
 	}
 }
 
@@ -359,7 +367,12 @@ func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int
 	s.forwards[forwarder.ID] = forwarder
 	s.mu.Unlock()
 
-	go forwarder.Start()
+	if err := forwarder.Start(); err != nil {
+		s.mu.Lock()
+		delete(s.forwards, forwarder.ID)
+		s.mu.Unlock()
+		return nil, err
+	}
 
 	return &ForwardInfo{
 		ID:         forwarder.ID,
@@ -368,6 +381,10 @@ func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int
 		LocalPort:  forwarder.LocalPort,
 		RemotePort: forwarder.RemotePort,
 	}, nil
+}
+
+func defaultRemoteListenerFactory(client *ssh.Client, addr string) (net.Listener, error) {
+	return client.Listen("tcp", addr)
 }
 
 // List returns all active port forwards.

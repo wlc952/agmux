@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -21,25 +22,45 @@ type Entry struct {
 // Logger writes audit entries to ~/.agmux/audit.log.
 type Logger struct {
 	file *os.File
+	mu   sync.Mutex
 }
 
 // NewLogger creates an audit logger.
 func NewLogger() *Logger {
-	homeDir, _ := os.UserHomeDir()
-	dir := filepath.Join(homeDir, ".agmux")
-	os.MkdirAll(dir, 0700)
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to resolve audit log home dir: %v\n", err)
+		return &Logger{}
+	}
 
-	f, err := os.OpenFile(filepath.Join(dir, "audit.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	logger, err := NewLoggerAt(filepath.Join(homeDir, ".agmux", "audit.log"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open audit log: %v\n", err)
 		return &Logger{}
 	}
 
-	return &Logger{file: f}
+	return logger
+}
+
+// NewLoggerAt creates an audit logger at an explicit path.
+func NewLoggerAt(path string) (*Logger, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, fmt.Errorf("failed to create audit log directory: %w", err)
+	}
+
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open audit log file: %w", err)
+	}
+
+	return &Logger{file: f}, nil
 }
 
 // Log writes an audit entry as one JSON line.
 func (l *Logger) Log(entry Entry) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if l.file == nil {
 		return nil
 	}
@@ -56,8 +77,13 @@ func (l *Logger) Log(entry Entry) error {
 
 // Close closes the audit log file.
 func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if l.file != nil {
-		return l.file.Close()
+		err := l.file.Close()
+		l.file = nil
+		return err
 	}
 	return nil
 }

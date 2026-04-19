@@ -10,8 +10,12 @@ func TestJoinCommandArgs(t *testing.T) {
 	}{
 		{name: "empty", args: nil, want: ""},
 		{name: "single", args: []string{"echo"}, want: "echo"},
-		{name: "multiple", args: []string{"echo", "hello", "world"}, want: "echo hello world"},
-		{name: "quoted fragments preserved", args: []string{"sh", "-c", "echo hi"}, want: "sh -c echo hi"},
+		{name: "single full command string stays raw", args: []string{"echo hello | wc -c"}, want: "echo hello | wc -c"},
+		{name: "multiple args are shell quoted", args: []string{"echo", "hello", "world"}, want: "'echo' 'hello' 'world'"},
+		{name: "space in argument is preserved", args: []string{"touch", "a b"}, want: "'touch' 'a b'"},
+		{name: "metacharacters stay literal", args: []string{"printf", "%s\n", "*"}, want: "'printf' '%s\n' '*'"},
+		{name: "single quote is escaped safely", args: []string{"printf", "pa'ss"}, want: "'printf' 'pa'\"'\"'ss'"},
+		{name: "empty arg is preserved", args: []string{"printf", ""}, want: "'printf' ''"},
 	}
 
 	for _, tt := range tests {

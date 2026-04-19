@@ -394,7 +394,28 @@ func handleRun(args []string) error {
 }
 
 func joinCommandArgs(args []string) string {
-	return strings.Join(args, " ")
+	switch len(args) {
+	case 0:
+		return ""
+	case 1:
+		// Preserve single-argument commands verbatim so shell syntax like pipes
+		// still works when the caller intentionally passed one complete string.
+		return args[0]
+	default:
+		quoted := make([]string, len(args))
+		for i, arg := range args {
+			quoted[i] = shellQuote(arg)
+		}
+		return strings.Join(quoted, " ")
+	}
+}
+
+func shellQuote(arg string) string {
+	if arg == "" {
+		return "''"
+	}
+
+	return "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
 }
 
 func handleList() error {

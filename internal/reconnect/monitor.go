@@ -16,6 +16,7 @@ type Monitor struct {
 	forwards *portforward.Service
 	watched  map[string]watchCtx
 	mu       sync.Mutex
+	connect  func(user, host string, port int, auth agssh.AuthConfig) (*agssh.Client, error)
 }
 
 type watchCtx struct {
@@ -24,9 +25,10 @@ type watchCtx struct {
 }
 
 const (
-	initialBackoff = 5 * time.Second
-	maxBackoff     = 5 * time.Minute
-	backoffFactor  = 2
+	monitorInterval = 5 * time.Second
+	initialBackoff  = 5 * time.Second
+	maxBackoff      = 5 * time.Minute
+	backoffFactor   = 2
 )
 
 // NewMonitor creates a new reconnect monitor.
@@ -35,6 +37,7 @@ func NewMonitor(sessions *session.Manager, forwards *portforward.Service) *Monit
 		sessions: sessions,
 		forwards: forwards,
 		watched:  make(map[string]watchCtx),
+		connect:  agssh.Connect,
 	}
 }
 
@@ -67,60 +70,64 @@ func (m *Monitor) StopWatch(name string) {
 }
 
 func (m *Monitor) monitorLoop(sess *session.SSHSession, ctx watchCtx) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	delay := monitorInterval
 
 	for {
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.cancel:
+			timer.Stop()
 			return
-		case <-ticker.C:
-			m.checkAndReconnect(sess, &ctx)
+		case <-timer.C:
+			delay = m.checkAndReconnect(sess, &ctx)
 		}
 	}
 }
 
-func (m *Monitor) checkAndReconnect(sess *session.SSHSession, ctx *watchCtx) {
+func (m *Monitor) checkAndReconnect(sess *session.SSHSession, ctx *watchCtx) time.Duration {
 	status := sess.GetStatus()
 	if status == session.StatusDisconnected {
 		m.StopWatch(sess.GetName())
-		return
+		return monitorInterval
 	}
 	if status == session.StatusConnecting || status == session.StatusReconnecting {
-		return
+		return monitorInterval
 	}
 
 	client := sess.GetClient()
-	if client == nil || !client.IsAlive() {
-		log.Printf("[reconnect] Session %s appears dead, reconnecting", sess.GetName())
-
-		sess.SetStatus(session.StatusReconnecting)
-		if client != nil {
-			client.Close()
-			sess.SetClient(nil)
-		}
-
-		newClient, err := agssh.Connect(sess.User, sess.Host, sess.Port, agssh.AuthConfig{
-			Password: sess.GetPassword(),
-			KeyPath:  sess.GetKeyPath(),
-		})
-		if err != nil {
-			log.Printf("[reconnect] Failed to reconnect %s: %v (backoff: %v)", sess.GetName(), err, ctx.backoff)
-			sess.SetStatus(session.StatusOffline)
-			time.Sleep(ctx.backoff)
-			ctx.backoff = min(ctx.backoff*time.Duration(backoffFactor), maxBackoff)
-			return
-		}
-
-		sess.SetClient(newClient)
-		sess.SetStatus(session.StatusConnected)
-
+	if client != nil && client.IsAlive() {
 		ctx.backoff = initialBackoff
-
-		if m.forwards != nil {
-			m.forwards.RestartAll(sess.GetName(), newClient.GoClient)
-		}
-
-		log.Printf("[reconnect] Session %s reconnected successfully", sess.GetName())
+		return monitorInterval
 	}
+
+	log.Printf("[reconnect] Session %s appears dead, reconnecting", sess.GetName())
+
+	sess.SetStatus(session.StatusReconnecting)
+	if client != nil {
+		client.Close()
+		sess.SetClient(nil)
+	}
+
+	newClient, err := m.connect(sess.User, sess.Host, sess.Port, agssh.AuthConfig{
+		Password: sess.GetPassword(),
+		KeyPath:  sess.GetKeyPath(),
+	})
+	if err != nil {
+		log.Printf("[reconnect] Failed to reconnect %s: %v (backoff: %v)", sess.GetName(), err, ctx.backoff)
+		sess.SetStatus(session.StatusOffline)
+		delay := ctx.backoff
+		ctx.backoff = min(ctx.backoff*time.Duration(backoffFactor), maxBackoff)
+		return delay
+	}
+
+	sess.SetClient(newClient)
+	sess.SetStatus(session.StatusConnected)
+	ctx.backoff = initialBackoff
+
+	if m.forwards != nil {
+		m.forwards.RestartAll(sess.GetName(), newClient.GoClient)
+	}
+
+	log.Printf("[reconnect] Session %s reconnected successfully", sess.GetName())
+	return monitorInterval
 }

@@ -172,7 +172,9 @@ func (s *sftpSession) Upload(localPath, remotePath string) (int64, error) {
 		targetPath := filepath.ToSlash(filepath.Join(remotePath, relPath))
 
 		if info.IsDir() {
-			s.client.MkdirAll(targetPath)
+			if err := s.client.MkdirAll(targetPath); err != nil {
+				return fmt.Errorf("failed to create remote directory %s: %w", targetPath, err)
+			}
 			return nil
 		}
 
@@ -187,7 +189,9 @@ func (s *sftpSession) Upload(localPath, remotePath string) (int64, error) {
 			return err
 		}
 		totalWritten += written
-		s.client.Chtimes(targetPath, info.ModTime(), info.ModTime())
+		if err := s.client.Chtimes(targetPath, info.ModTime(), info.ModTime()); err != nil {
+			return fmt.Errorf("failed to preserve remote timestamps for %s: %w", targetPath, err)
+		}
 		return nil
 	})
 
@@ -206,6 +210,10 @@ func (s *sftpSession) uploadFile(localPath, remotePath string) (int64, error) {
 		return 0, fmt.Errorf("failed to stat local file: %w", err)
 	}
 
+	if err := s.client.MkdirAll(filepath.ToSlash(filepath.Dir(remotePath))); err != nil {
+		return 0, fmt.Errorf("failed to create remote parent directory: %w", err)
+	}
+
 	remoteFile, err := s.client.Create(remotePath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create remote file: %w", err)
@@ -217,7 +225,9 @@ func (s *sftpSession) uploadFile(localPath, remotePath string) (int64, error) {
 		return 0, fmt.Errorf("failed to upload file: %w", err)
 	}
 
-	s.client.Chmod(remotePath, localInfo.Mode())
+	if err := s.client.Chmod(remotePath, localInfo.Mode()); err != nil {
+		return 0, fmt.Errorf("failed to preserve remote mode: %w", err)
+	}
 	return written, nil
 }
 
@@ -253,7 +263,9 @@ func (s *sftpSession) Download(remotePath, localPath string) (int64, error) {
 		targetPath := filepath.Join(localPath, relPath)
 
 		if info.IsDir() {
-			os.MkdirAll(targetPath, info.Mode())
+			if err := os.MkdirAll(targetPath, info.Mode()); err != nil {
+				return totalWritten, fmt.Errorf("failed to create local directory %s: %w", targetPath, err)
+			}
 			continue
 		}
 
@@ -268,7 +280,9 @@ func (s *sftpSession) Download(remotePath, localPath string) (int64, error) {
 			return totalWritten, err
 		}
 		totalWritten += written
-		os.Chtimes(targetPath, info.ModTime(), info.ModTime())
+		if err := os.Chtimes(targetPath, info.ModTime(), info.ModTime()); err != nil {
+			return totalWritten, fmt.Errorf("failed to preserve local timestamps for %s: %w", targetPath, err)
+		}
 	}
 
 	return totalWritten, nil
@@ -280,6 +294,10 @@ func (s *sftpSession) downloadFile(remotePath, localPath string) (int64, error) 
 		return 0, fmt.Errorf("failed to open remote file: %w", err)
 	}
 	defer remoteFile.Close()
+
+	if err := ensureLocalParentDir(localPath); err != nil {
+		return 0, err
+	}
 
 	localFile, err := os.Create(localPath)
 	if err != nil {
@@ -294,7 +312,9 @@ func (s *sftpSession) downloadFile(remotePath, localPath string) (int64, error) 
 
 	remoteInfo, err := s.client.Stat(remotePath)
 	if err == nil {
-		os.Chmod(localPath, remoteInfo.Mode())
+		if chmodErr := os.Chmod(localPath, remoteInfo.Mode()); chmodErr != nil {
+			return 0, fmt.Errorf("failed to preserve local mode: %w", chmodErr)
+		}
 	}
 
 	return written, nil
@@ -324,6 +344,17 @@ func (s *sftpSession) Remove(path string) error {
 func checkPathTraversal(relPath string) error {
 	if !filepath.IsLocal(relPath) {
 		return fmt.Errorf("path traversal detected: %s escapes destination", relPath)
+	}
+	return nil
+}
+
+func ensureLocalParentDir(localPath string) error {
+	parent := filepath.Dir(localPath)
+	if parent == "." {
+		return nil
+	}
+	if err := os.MkdirAll(parent, 0755); err != nil {
+		return fmt.Errorf("failed to create local parent directory %s: %w", parent, err)
 	}
 	return nil
 }
