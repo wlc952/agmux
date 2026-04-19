@@ -313,7 +313,6 @@ func waitStreamTimeout(done <-chan streamExecResult, sshSession *ssh.Session, cm
 	}
 }
 
-
 func runRemote(client *ssh.Client, command string, timeout int, sudoOpts *protocol.SudoOptions) (*protocol.ExecResult, error) {
 	sshSession, err := client.NewSession()
 	if err != nil {
