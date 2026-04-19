@@ -4,11 +4,34 @@ agmux 是一个为 AI Agent 设计的 SSH/本地会话管理和命令执行工�
 
 **设计原则：完全非交互、纯脚本化。所有参数通过命令行传递，不依赖 TTY。**
 
+## 为什么 Agent 应该用 agmux 而不是直接 SSH？
+
+Agent（AI agent、自动化脚本）通过 agmux 执行远程命令比直接调用 `ssh` 有本质性优势：
+
+| 比较项 | 直接 SSH | agmux |
+| --- | --- | --- |
+| **连接持久性** | 每次执行都新建连接，耗时 + 资源浪费 | daemon 保持长连接，多命令复用同一 SSH 通道 |
+| **断线恢复** | 网络抖动即失败，agent 必须手动重试 | 自动指数退避重连（5s→10s→...→5min），端口转发同步恢复 |
+| **结构化输出** | stdout/stderr 混合输出，exit code 需解析 | JSON 返回 `{stdout, stderr, exit_code}`，零歧义解析 |
+| **流式输出** | 无结构化流式能力 | `--stream` 实时推送 stdout/stderr chunk，带帧边界标识 |
+| **会话命名** | 无 | 命名会话（`production`、`dev`），多主机一目了然 |
+| **detach/attach** | 无 | detach 保持 SSH 存活（端口转发继续工作），attach 恢复使用 |
+| **sudo 安全** | 密码拼接到 shell 命令 → shell 注入风险 | `sudo -S` + stdin 写入密码，零 shell 注入 |
+| **超时控制** | 依赖 SSH 配置或手动 timeout | 内置 `-t timeout`，超时 SIGKILL + 返回 exit_code -1 |
+| **审计日志** | 无 | 所有操作自动记录到 `~/.agmux/audit.log`（JSON 格式） |
+| **状态持久化** | 无 | daemon 重启后恢复会话状态，密钥会话自动重连 |
+| **端口转发** | 需保持 SSH 进程存活 | detach 后转发继续工作，重连后转发自动恢复 |
+| **TTY 依赖** | 很多 SSH 操作隐式依赖 PTY | 完全非交互，不需要 TTY，适合 agent 程序化调用 |
+| **远端零配置** | — | 远端仅需标准 SSH 服务，无需安装任何额外软件 |
+
+**核心要点**：agmux 把"SSH 连接"从"每条命令的生命周期"中解耦出来——连接由 daemon 持久管理，命令在已有连接上执行。这让 agent 不再需要处理连接建立、断线重试、输出解析等底层问题。
+
 ## 特性
 
 - 命名会话管理（SSH + 本地）
 - detach/attach 语义：detach 保持 SSH 连接存活，kill 才真正关闭
 - 本地命令执行（无需 SSH）
+- 流式命令输出：实时推送 stdout/stderr（`--stream`）
 - 结构化输出：stdout/stderr/exit_code 分离返回
 - TCP 端口转发（本地/远程）
 - 断线自动重连（指数退避：5s → 10s → 20s → ... → max 5min）
@@ -21,23 +44,21 @@ agmux 是一个为 AI Agent 设计的 SSH/本地会话管理和命令执行工�
 
 ## 架构
 
-```
-┌──────────────┐  Unix Socket (0600)  ┌──────────────────┐
-│  agmux CLI   │ ──────────────────── │  agmux-server    │
-│  (薄客户端)  │  imsg 二进制协议      │  (常驻进程)       │
-└──────────────┘                       │                  │
-                                       │  Session Manager │
-                                       │  ┌──────────────┤
-                                       │  │ SSH Session  │────── SSH tunnel
-                                       │  │ Local Session│────── local exec
-                                       │  └──────────────┤
-                                       │  Services:      │
-                                       │  ExecService    │
-                                       │  ForwardService │
-                                       │  TransferService│
-                                       │  ReconnectMon   │
-                                       │  AuditLogger    │
-                                       └──────────────────┘
+```text
++----------------+     Unix Socket (0600) / imsg      +----------------------+
+| agmux CLI      | <---------------------------------> | agmux-server daemon  |
+| thin client    |                                     |                      |
++----------------+                                     |  Session Manager     |
+                                                       |    |- SSH Session ---+--> SSH tunnel
+                                                       |    |- Local Session -+--> local exec
+                                                       |                      |
+                                                       |  Services            |
+                                                       |    - ExecService     |
+                                                       |    - ForwardService  |
+                                                       |    - TransferService |
+                                                       |    - ReconnectMon    |
+                                                       |    - AuditLogger     |
+                                                       +----------------------+
 ```
 
 ## 安装
@@ -98,6 +119,10 @@ agmux exec -n production "pwd"
 # 带超时（秒）
 agmux exec -t 10 "sleep 5"
 
+# 流式输出（实时推送 stdout/stderr，适合长耗时命令）
+agmux exec --stream "tail -f /var/log/syslog"
+agmux exec --stream -n production "python train.py"
+
 # sudo 命令（安全方式，无 shell 注入）
 agmux exec --sudo --sudo-password "1234" "systemctl restart nginx"
 
@@ -110,7 +135,18 @@ agmux exec --sudo --sudo-password "1234" --sudo-login "whoami"
 # 一次性本地执行（无需会话）
 agmux run "ls -la /tmp"
 agmux run --sudo --sudo-password "1234" "cat /etc/shadow"
+
+# 一次性本地执行 + 流式输出
+agmux run --stream "docker build -t app ."
 ```
+
+### 流式输出详解
+
+`--stream` 模式适用于长耗时命令（日志监控、训练任务、构建过程等），stdout/stderr 实时逐块推送，而非等待命令结束才返回全部输出：
+
+- 每个输出块标识来源（`stdout` 或 `stderr`），不会混淆
+- 命令结束时发送 `StreamEnd`，包含 `exit_code` 和可能的 `error`
+- 输出块之间有帧边界，不存在解析歧义
 
 ### 会话管理
 
@@ -192,7 +228,7 @@ agmux -v
 ## 命令行选项
 
 | 选项 | 说明 |
-|------|------|
+| --- | --- |
 | `-S socket_path` | Unix socket 路径（默认：`$XDG_RUNTIME_DIR/agmux/agmux.sock`，否则 `~/.agmux/run/agmux.sock`） |
 | `-n name` | 会话名称 |
 | `-u user` | 用户名 |
@@ -201,6 +237,7 @@ agmux -v
 | `-P password` | SSH 密码 |
 | `-i key_path` | SSH 密钥路径 |
 | `-t timeout` | 命令超时时间（秒） |
+| `--stream` | 流式输出（实时推送 stdout/stderr，适合长耗时命令） |
 | `--sudo` | 启用 sudo |
 | `--sudo-password` | sudo 密码 |
 | `--sudo-user` | sudo 以指定用户运行 |
@@ -216,7 +253,7 @@ agmux -v
 
 ## 项目结构
 
-```
+```text
 agmux/
 ├── cmd/
 │   ├── agmux/main.go              # CLI 客户端
@@ -225,7 +262,7 @@ agmux/
 │   ├── protocol/                   # 消息类型 + 请求/响应结构体
 │   ├── ssh/                        # SSH 客户端 + TOFU + 认证
 │   ├── session/                    # 命名会话 + detach/attach/kill
-│   ├── exec/                       # 命令执行（SSH + 本地 + sudo）
+│   ├── exec/                       # 命令执行（SSH + 本地 + sudo + stream）
 │   ├── portforward/                # 端口转发 + 生命周期管理
 │   ├── transfer/                   # SFTP 文件传输
 │   ├── reconnect/                  # 指数退避重连监控
