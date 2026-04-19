@@ -213,9 +213,6 @@ agmux ping
 # 停止 daemon（优雅关闭：保存状态 → 关闭连接 → 清理）
 agmux stop
 
-# 强制重连
-agmux reconnect -n production
-
 # 查看版本
 agmux -v
 ```

@@ -1,6 +1,6 @@
 ---
 name: agmux
-description: '说明 agmux 能做什么以及如何使用。适用于 agmux capabilities, quickstart, session lifecycle, exec/run, stream, sudo, forwarding, transfer, reconnect, troubleshooting.'
+description: '说明 agmux 能做什么以及如何使用。适用于 agmux capabilities, quickstart, session lifecycle, exec/run, stream, sudo, forwarding, transfer, troubleshooting.'
 argument-hint: '请描述你的场景，例如：首次连接、执行命令、端口转发、文件传输、重连恢复、故障排查'
 ---
 
@@ -169,14 +169,8 @@ agmux sftp -n <session> -c rm -p <remote_path>
 ```bash
 agmux list
 agmux use <session>           # 切换默认 / 恢复断开的会话
-agmux use <session> -P <pass> # 恢复离线会话（提供认证）
+agmux use <session> -p <pass> # 恢复离线会话（提供认证）
 agmux kill <session>
-```
-
-需要时强制重连：
-
-```bash
-agmux reconnect -n <session>
 ```
 
 ### 7. 完成验证

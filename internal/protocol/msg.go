@@ -4,6 +4,7 @@ package protocol
 const (
 	MsgConnect         uint16 = 1  // Connect to SSH host
 	MsgLocal           uint16 = 2  // Create local session
+	// MsgDetach (3) and MsgAttach (5) removed — vacant, do not reuse
 	MsgKill            uint16 = 4  // Kill session
 	MsgExec            uint16 = 6  // Execute command in session
 	MsgLocalExec       uint16 = 7  // One-off local exec (no session)
@@ -16,7 +17,7 @@ const (
 	MsgSFTPLs          uint16 = 14 // SFTP list directory
 	MsgSFTPMkdir       uint16 = 15 // SFTP mkdir
 	MsgSFTPRm          uint16 = 16 // SFTP remove
-	MsgReconnect       uint16 = 17 // Force reconnect
+	// MsgReconnect (17) removed — use MsgUse with -p/-i instead
 	MsgPing            uint16 = 18 // Health check
 	MsgStop            uint16 = 19 // Stop daemon
 	MsgExecStream      uint16 = 20 // Execute command with streaming output

@@ -86,8 +86,6 @@ func main() {
 		err = handleSCP(subArgs)
 	case "sftp":
 		err = handleSFTP(subArgs)
-	case "reconnect":
-		err = handleReconnect(subArgs)
 	case "ping":
 		err = handlePing()
 	case "stop":
@@ -772,21 +770,6 @@ func handleSFTP(args []string) error {
 	return nil
 }
 
-func handleReconnect(args []string) error {
-	fs := flag.NewFlagSet("reconnect", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-	name := fs.String("n", "", "Session name")
-	fs.Parse(args)
-
-	_, err := sendRequest(protocol.MsgReconnect, protocol.ReconnectParams{Name: *name})
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("Reconnected")
-	return nil
-}
-
 func handlePing() error {
 	_, err := sendRequest(protocol.MsgPing, nil)
 	if err != nil {
@@ -848,7 +831,6 @@ Usage:
   agmux scp [-n name] -put|-get <src> <dst>
   agmux sync [-n name] -put|-get <src> <dst>
   agmux sftp [-n name] -c ls|mkdir|rm -d <path>
-  agmux reconnect [-n name]
   agmux ping                                     Check daemon
   agmux stop                                     Stop daemon
   agmux -v, --version
@@ -871,7 +853,7 @@ Options:
   --public          Shortcut for --bind 0.0.0.0
 
 Examples:
-  agmux connect -u admin -h 10.0.1.1 -n production -P password
+  agmux connect -u admin -h 10.0.1.1 -n production -p password
   agmux exec -n production "ls -la"
   agmux exec --sudo --sudo-password 1234 "ls /root/"
   agmux run "ls -la /tmp"

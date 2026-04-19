@@ -313,15 +313,24 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
+		// Check status before Use to decide if reconnect monitor is needed
+		sess, _ := s.sessions.Get(params.Name)
+		wasOffline := false
+		if sess != nil && !sess.IsLocal() {
+			status := sess.(*session.SSHSession).GetStatus()
+			wasOffline = status == session.StatusOffline || status == session.StatusDisconnected
+		}
+
 		err := s.sessions.Use(params.Name, params.Password, params.KeyPath)
 		if err != nil {
 			return nil, err
 		}
-		// Reconnect monitor for SSH sessions that were offline
-		sess, _ := s.sessions.Get(params.Name)
-		if sess != nil && !sess.IsLocal() {
-			sshSess := sess.(*session.SSHSession)
-			s.reconnect.Watch(sshSess)
+		// Only register reconnect monitor if session was offline/disconnected before Use
+		if wasOffline {
+			sess, _ = s.sessions.Get(params.Name)
+			if sess != nil && !sess.IsLocal() {
+				s.reconnect.Watch(sess.(*session.SSHSession))
+			}
 		}
 		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"ok"}`)), nil
 
@@ -412,25 +421,6 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		}
 		s.audit.Log(audit.Entry{Session: params.Name, Action: "sftp_rm", Command: params.Path, Result: "success"})
 		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"removed"}`)), nil
-
-	case protocol.MsgReconnect:
-		var params protocol.ReconnectParams
-		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
-			return nil, fmt.Errorf("invalid params: %w", err)
-		}
-		sess, err := s.sessions.Get(params.Name)
-		if err != nil {
-			return nil, err
-		}
-		if sess.IsLocal() {
-			return nil, fmt.Errorf("local sessions cannot reconnect")
-		}
-		sshSess := sess.(*session.SSHSession)
-		err = s.sessions.Use(params.Name, sshSess.GetPassword(), sshSess.GetKeyPath())
-		if err != nil {
-			return nil, err
-		}
-		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"reconnected"}`)), nil
 
 	case protocol.MsgStop:
 		// Trigger graceful shutdown from CLI

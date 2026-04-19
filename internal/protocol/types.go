@@ -111,10 +111,6 @@ type SFTPParams struct {
 	Path    string `json:"path"`
 }
 
-type ReconnectParams struct {
-	Name string `json:"name,omitempty"`
-}
-
 // StreamChunk carries an incremental chunk of command output during streaming exec.
 type StreamChunk struct {
 	Stream string `json:"stream"` // "stdout" or "stderr"

@@ -124,7 +124,7 @@ const (
     MsgSFTPLs        uint16 = 14  // SFTP list directory
     MsgSFTPMkdir     uint16 = 15  // SFTP mkdir
     MsgSFTPRm        uint16 = 16  // SFTP remove
-    MsgReconnect     uint16 = 17  // Force reconnect
+    MsgReconnect     uint16 = 17  // Removed — use MsgUse with -p/-i instead
     MsgPing          uint16 = 18  // Health check
 )
 
@@ -254,13 +254,13 @@ They exist so agents can manage both remote and local operations under the same 
 ```
 connecting → connected → disconnected (after kill)
                        → reconnecting → connected / offline
-                       → offline → (use -P/-i → connected)
+                       → offline → (use -p/-i → connected)
 ```
 
 - **connected**: SSH alive, session usable
 - **disconnected**: SSH closed (after kill)
 - **reconnecting**: connection lost, attempting reconnect
-- **offline**: reconnect failed, agent must `use -P/-i` to restore
+- **offline**: reconnect failed, agent must `use -p/-i` to restore
 
 ### Manager (internal/session/manager.go)
 
@@ -525,8 +525,7 @@ agmux forwards                               # List forwards
 agmux forward-close <id>
 agmux scp [-n name] -put|-get <src> <dst>
 agmux sync [-n name] -put|-get <src> <dst>
-agmux sftp [-n name] -c ls|mkdir|rm -p <path>
-agmux reconnect [-n name]
+agmux sftp [-n name] -c ls|mkdir|rm -d <path>
 agmux ping                                   # Check daemon alive
 agmux stop                                   # Stop daemon gracefully
 agmux -v, --version
