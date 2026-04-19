@@ -66,12 +66,8 @@ func main() {
 		err = handleConnect(subArgs)
 	case "local":
 		err = handleLocal(subArgs)
-	case "detach":
-		err = handleDetach(subArgs)
 	case "kill":
 		err = handleKill(subArgs)
-	case "attach":
-		err = handleAttach(subArgs)
 	case "exec":
 		err = handleExec(subArgs)
 	case "run":
@@ -304,8 +300,8 @@ func handleConnect(args []string) error {
 	name := fs.String("n", "", "Session name")
 	user := fs.String("u", "", "Username")
 	host := fs.String("h", "", "Host")
-	port := fs.Int("p", 22, "Port")
-	password := fs.String("P", "", "Password")
+	port := fs.Int("P", 22, "Port")
+	password := fs.String("p", "", "Password")
 	keyPath := fs.String("i", "", "SSH key path")
 
 	fs.Parse(args)
@@ -360,18 +356,27 @@ func handleLocal(args []string) error {
 	return nil
 }
 
-func handleDetach(args []string) error {
-	fs := flag.NewFlagSet("detach", flag.ContinueOnError)
+func handleUse(args []string) error {
+	fs := flag.NewFlagSet("use", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
-	name := fs.String("n", "", "Session name")
+	password := fs.String("p", "", "Password (for reconnecting offline session)")
+	keyPath := fs.String("i", "", "SSH key path (for reconnecting offline session)")
 	fs.Parse(args)
 
-	_, err := sendRequest(protocol.MsgDetach, protocol.DetachParams{Name: *name})
+	if fs.NArg() < 1 {
+		return fmt.Errorf("session name required")
+	}
+
+	_, err := sendRequest(protocol.MsgUse, protocol.UseParams{
+		Name:     fs.Arg(0),
+		Password: *password,
+		KeyPath:  *keyPath,
+	})
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("Detached")
+	fmt.Printf("Using session: %s\n", fs.Arg(0))
 	return nil
 }
 
@@ -393,28 +398,6 @@ func handleKill(args []string) error {
 	}
 
 	fmt.Println("Killed")
-	return nil
-}
-
-func handleAttach(args []string) error {
-	fs := flag.NewFlagSet("attach", flag.ContinueOnError)
-	fs.SetOutput(os.Stderr)
-
-	name := fs.String("n", "", "Session name")
-	password := fs.String("P", "", "Password (for reconnecting)")
-	keyPath := fs.String("i", "", "SSH key path (for reconnecting)")
-	fs.Parse(args)
-
-	_, err := sendRequest(protocol.MsgAttach, protocol.AttachParams{
-		Name:     *name,
-		Password: *password,
-		KeyPath:  *keyPath,
-	})
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("Attached")
 	return nil
 }
 
@@ -583,20 +566,6 @@ func handleList() error {
 	return nil
 }
 
-func handleUse(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("session name required")
-	}
-
-	_, err := sendRequest(protocol.MsgUse, protocol.UseParams{Name: args[0]})
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Using session: %s\n", args[0])
-	return nil
-}
-
 func handleForward(args []string) error {
 	fs := flag.NewFlagSet("forward", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -757,7 +726,7 @@ func handleSFTP(args []string) error {
 
 	name := fs.String("n", "", "Session name")
 	command := fs.String("c", "", "SFTP command (ls, mkdir, rm)")
-	path := fs.String("p", ".", "Path")
+	path := fs.String("d", ".", "Remote path")
 
 	fs.Parse(args)
 
@@ -866,21 +835,19 @@ func printUsage() {
 
 Usage:
   agmux start                                    Start daemon
-  agmux connect -u user -h host [-n name] [-p port] [-P password] [-i key]
+  agmux connect -u user -h host [-n name] [-P port] [-p password] [-i key]
   agmux local [-n name]                          Create local session
-  agmux attach [-n name] [-P password] [-i key]  Attach to session
-  agmux detach [-n name]                         Detach (SSH stays alive)
   agmux kill [-n name]                           Kill session
   agmux exec [-n name] [-t timeout] [--stream] [--sudo ...] "command"
   agmux run [-t timeout] [--stream] [--sudo ...] "command"  One-off local exec
   agmux list | ls                                List sessions
-  agmux use <name>                               Set default session
+  agmux use <name> [-p password] [-i key]        Switch default / reconnect session
   agmux forward [-n name] -l local -r remote [-R] [--bind addr|--public]
   agmux forwards                                 List forwards
   agmux forward-close <id>
   agmux scp [-n name] -put|-get <src> <dst>
   agmux sync [-n name] -put|-get <src> <dst>
-  agmux sftp [-n name] -c ls|mkdir|rm -p <path>
+  agmux sftp [-n name] -c ls|mkdir|rm -d <path>
   agmux reconnect [-n name]
   agmux ping                                     Check daemon
   agmux stop                                     Stop daemon
@@ -889,6 +856,11 @@ Usage:
 Options:
   -S socket_path    Unix socket path (default: %s)
   -n name           Session name
+  -u user           Username
+  -h host           Host address
+  -P port           SSH port (default: 22)
+  -p password       SSH password
+  -i key_path       SSH key path
   -t timeout        Command timeout in seconds
   --sudo            Run with sudo
   --sudo-password   Sudo password
@@ -903,8 +875,7 @@ Examples:
   agmux exec -n production "ls -la"
   agmux exec --sudo --sudo-password 1234 "ls /root/"
   agmux run "ls -la /tmp"
-  agmux detach -n production
-  agmux attach -n production
+  agmux use production -p password
   agmux forward -n production -l 8080 -r 80
 `, version, defaultSocketPath())
 }

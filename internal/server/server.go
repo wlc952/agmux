@@ -258,18 +258,6 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		payload, _ := protocol.EncodePayload(info)
 		return imsg.NewImsg(protocol.MsgResult, payload), nil
 
-	case protocol.MsgDetach:
-		var params protocol.DetachParams
-		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
-			return nil, fmt.Errorf("invalid params: %w", err)
-		}
-		err := s.sessions.Detach(params.Name)
-		if err != nil {
-			return nil, err
-		}
-		s.audit.Log(audit.Entry{Session: params.Name, Action: "detach", Result: "success"})
-		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"detached"}`)), nil
-
 	case protocol.MsgKill:
 		var params protocol.KillParams
 		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
@@ -282,23 +270,6 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		}
 		s.audit.Log(audit.Entry{Session: params.Name, Action: "kill", Result: "success"})
 		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"killed"}`)), nil
-
-	case protocol.MsgAttach:
-		var params protocol.AttachParams
-		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
-			return nil, fmt.Errorf("invalid params: %w", err)
-		}
-		err := s.sessions.Attach(params.Name, params.Password, params.KeyPath)
-		if err != nil {
-			return nil, err
-		}
-		s.audit.Log(audit.Entry{Session: params.Name, Action: "attach", Result: "success"})
-		sess, _ := s.sessions.Get(params.Name)
-		if sess != nil && !sess.IsLocal() {
-			sshSess := sess.(*session.SSHSession)
-			s.reconnect.Watch(sshSess)
-		}
-		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"attached"}`)), nil
 
 	case protocol.MsgExec:
 		var params protocol.ExecParams
@@ -342,9 +313,15 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		err := s.sessions.Use(params.Name)
+		err := s.sessions.Use(params.Name, params.Password, params.KeyPath)
 		if err != nil {
 			return nil, err
+		}
+		// Reconnect monitor for SSH sessions that were offline
+		sess, _ := s.sessions.Get(params.Name)
+		if sess != nil && !sess.IsLocal() {
+			sshSess := sess.(*session.SSHSession)
+			s.reconnect.Watch(sshSess)
 		}
 		return imsg.NewImsg(protocol.MsgResult, []byte(`{"status":"ok"}`)), nil
 
@@ -449,7 +426,7 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 			return nil, fmt.Errorf("local sessions cannot reconnect")
 		}
 		sshSess := sess.(*session.SSHSession)
-		err = s.sessions.Attach(params.Name, sshSess.GetPassword(), sshSess.GetKeyPath())
+		err = s.sessions.Use(params.Name, sshSess.GetPassword(), sshSess.GetKeyPath())
 		if err != nil {
 			return nil, err
 		}
@@ -530,7 +507,7 @@ func (s *Server) restoreState() {
 			continue
 		}
 
-		// SSH sessions: register as offline (agent must re-attach with credentials)
+		// SSH sessions: register as offline (agent must re-use with credentials)
 		s.sessions.RegisterOfflineSession(
 			state.Name, state.User, state.Host, state.Port,
 			state.KeyPath, time.Unix(state.CreatedAt, 0),

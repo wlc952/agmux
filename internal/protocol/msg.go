@@ -4,9 +4,7 @@ package protocol
 const (
 	MsgConnect         uint16 = 1  // Connect to SSH host
 	MsgLocal           uint16 = 2  // Create local session
-	MsgDetach          uint16 = 3  // Detach from session
 	MsgKill            uint16 = 4  // Kill session
-	MsgAttach          uint16 = 5  // Attach to existing session
 	MsgExec            uint16 = 6  // Execute command in session
 	MsgLocalExec       uint16 = 7  // One-off local exec (no session)
 	MsgList            uint16 = 8  // List sessions

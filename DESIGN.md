@@ -2,7 +2,7 @@
 
 agmux (Agent Multiplexer) is a session management and command execution tool for AI agents.
 Inspired by tmux's client-server architecture, it manages both SSH and local sessions,
-providing detach/attach semantics, structured output, and automatic reconnect.
+providing session switching with reconnect, structured output, and automatic reconnect.
 
 ## 1. Architecture Overview
 
@@ -252,16 +252,15 @@ They exist so agents can manage both remote and local operations under the same 
 ### Status Lifecycle
 
 ```
-connecting → connected → detached → (attach → connected)
-                       → disconnected (after kill)
+connecting → connected → disconnected (after kill)
                        → reconnecting → connected / offline
+                       → offline → (use -P/-i → connected)
 ```
 
-- **connected**: SSH alive, agent actively using
-- **detached**: SSH alive, agent not using (port forwards still work!)
+- **connected**: SSH alive, session usable
 - **disconnected**: SSH closed (after kill)
 - **reconnecting**: connection lost, attempting reconnect
-- **offline**: reconnect failed
+- **offline**: reconnect failed, agent must `use -P/-i` to restore
 
 ### Manager (internal/session/manager.go)
 
@@ -477,8 +476,8 @@ func (s *Store) Load() ([]*SessionState, error)
 On daemon startup:
 - Load state from disk
 - Auto-create local session
-- SSH sessions: attempt reconnect (status `connected`/`detached`)
-  - If no password/key available → status `offline`, agent must `attach -P password`
+- SSH sessions: attempt reconnect (status `connected`)
+  - If no password/key available → status `offline`, agent must `use -p password`
   - If key available → auto-reconnect
 
 ## 11. Audit Logging
@@ -493,7 +492,7 @@ type Logger struct {
 type Entry struct {
     Timestamp time.Time `json:"timestamp"`
     Session   string    `json:"session"`
-    Action    string    `json:"action"`    // connect, detach, kill, exec, forward, etc.
+    Action    string    `json:"action"`    // connect, use, kill, exec, forward, etc.
     Command   string    `json:"cmd,omitempty"`
     Result    string    `json:"result"`    // success, error, timeout
     Detail    string    `json:"detail,omitempty"`
@@ -514,15 +513,13 @@ func (l *Logger) Log(entry Entry) error   // Append one JSON line
 
 ```
 agmux start                                  # Start daemon (fork to background)
-agmux connect -u user -h host [-p port] [-n name] [-P password] [-i key]
+agmux connect -u user -h host [-P port] [-n name] [-p password] [-i key]
 agmux local [-n name]                        # Create local session
-agmux attach [-n name] [-P password]          # Attach to detached session
-agmux detach [-n name]                       # Detach (SSH stays alive)
 agmux kill [-n name]                         # Kill session (close SSH)
 agmux exec [-n name] [-t timeout] [--sudo ...] "command"
 agmux run [-t timeout] [--sudo ...] "command" # One-off local exec (no session)
 agmux list | ls                              # List sessions
-agmux use <name>                             # Set default session
+agmux use <name> [-p password] [-i key]      # Switch default / reconnect session
 agmux forward [-n name] -l local -r remote [-R] [--bind addr|--public]
 agmux forwards                               # List forwards
 agmux forward-close <id>

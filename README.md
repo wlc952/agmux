@@ -1,6 +1,6 @@
 # agmux - Agent Multiplexer
 
-agmux 是一个为 AI Agent 设计的 SSH/本地会话管理和命令执行工具。借鉴 tmux 的 client-server 架构，支持命名会话、detach/attach 语义、结构化输出和自动重连。
+agmux 是一个为 AI Agent 设计的 SSH/本地会话管理和命令执行工具。借鉴 tmux 的 client-server 架构，支持命名会话、会话切换与重连、结构化输出和自动重连。
 
 **设计原则：完全非交互、纯脚本化。所有参数通过命令行传递，不依赖 TTY。**
 
@@ -15,12 +15,12 @@ Agent（AI agent、自动化脚本）通过 agmux 执行远程命令比直接调
 | **结构化输出** | stdout/stderr 混合输出，exit code 需解析 | JSON 返回 `{stdout, stderr, exit_code}`，零歧义解析 |
 | **流式输出** | 无结构化流式能力 | `--stream` 实时推送 stdout/stderr chunk，带帧边界标识 |
 | **会话命名** | 无 | 命名会话（`production`、`dev`），多主机一目了然 |
-| **detach/attach** | 无 | detach 保持 SSH 存活（端口转发继续工作），attach 恢复使用 |
+| **会话切换与重连** | 无 | `use` 切换默认会话，自动恢复断开的 SSH 连接 |
 | **sudo 安全** | 密码拼接到 shell 命令 → shell 注入风险 | `sudo -S` + stdin 写入密码，零 shell 注入 |
 | **超时控制** | 依赖 SSH 配置或手动 timeout | 内置 `-t timeout`，超时 SIGKILL + 返回 exit_code -1 |
 | **审计日志** | 无 | 所有操作自动记录到 `~/.agmux/audit.log`（JSON 格式） |
 | **状态持久化** | 无 | daemon 重启后恢复会话状态，密钥会话自动重连 |
-| **端口转发** | 需保持 SSH 进程存活 | detach 后转发继续工作，重连后转发自动恢复 |
+| **端口转发** | 需保持 SSH 进程存活 | 断线后转发继续工作，重连后转发自动恢复 |
 | **TTY 依赖** | 很多 SSH 操作隐式依赖 PTY | 完全非交互，不需要 TTY，适合 agent 程序化调用 |
 | **远端零配置** | — | 远端仅需标准 SSH 服务，无需安装任何额外软件 |
 
@@ -29,7 +29,7 @@ Agent（AI agent、自动化脚本）通过 agmux 执行远程命令比直接调
 ## 特性
 
 - 命名会话管理（SSH + 本地）
-- detach/attach 语义：detach 保持 SSH 连接存活，kill 才真正关闭
+- 会话切换与重连：`use` 切换默认会话，自动恢复断开的 SSH 连接
 - 本地命令执行（无需 SSH）
 - 流式命令输出：实时推送 stdout/stderr（`--stream`）
 - 结构化输出：stdout/stderr/exit_code 分离返回
@@ -88,13 +88,13 @@ agmux-server &
 
 ```bash
 # 密码认证
-agmux connect -u admin1 -h 192.168.1.1 -p 7080 -P "your-password"
+agmux connect -u admin1 -h 192.168.1.1 -P 7080 -p "your-password"
 
 # 密钥认证
 agmux connect -u admin1 -h example.com -i ~/.ssh/id_ed25519
 
 # 指定会话名称
-agmux connect -u admin -h 10.0.1.1 -n production -P password
+agmux connect -u admin -h 10.0.1.1 -n production -p password
 ```
 
 ### 创建本地会话
@@ -154,17 +154,12 @@ agmux run --stream "docker build -t app ."
 # 列出所有会话
 agmux list
 
-# 切换默认会话
+# 切换默认会话（已连接的会话仅切换默认）
 agmux use production
 
-# 脱离会话（SSH 连接保持存活，端口转发继续工作）
-agmux detach -n production
-
-# 重新附着到会话
-agmux attach -n production
-
-# 重新附着并提供密码（用于 daemon 重启后的离线会话）
-agmux attach -n production -P password
+# 切换并恢复断开的会话（提供认证凭据）
+agmux use production -p password
+agmux use production -i ~/.ssh/id_ed25519
 
 # 关闭会话（真正关闭 SSH 连接）
 agmux kill production
@@ -233,8 +228,8 @@ agmux -v
 | `-n name` | 会话名称 |
 | `-u user` | 用户名 |
 | `-h host` | 主机地址 |
-| `-p port` | SSH 端口（默认：22） |
-| `-P password` | SSH 密码 |
+| `-P port` | SSH 端口（默认：22） |
+| `-p password` | SSH 密码 |
 | `-i key_path` | SSH 密钥路径 |
 | `-t timeout` | 命令超时时间（秒） |
 | `--stream` | 流式输出（实时推送 stdout/stderr，适合长耗时命令） |
@@ -261,7 +256,7 @@ agmux/
 ├── internal/
 │   ├── protocol/                   # 消息类型 + 请求/响应结构体
 │   ├── ssh/                        # SSH 客户端 + TOFU + 认证
-│   ├── session/                    # 命名会话 + detach/attach/kill
+│   ├── session/                    # 命名会话 + use/kill
 │   ├── exec/                       # 命令执行（SSH + 本地 + sudo + stream）
 │   ├── portforward/                # 端口转发 + 生命周期管理
 │   ├── transfer/                   # SFTP 文件传输
@@ -281,7 +276,7 @@ agmux/
 
 - **不支持交互式命令**：vim、less、top 等需要 TTY 的程序无法使用
 - **密码暴露**：密码通过命令行传递，在 `ps aux` 中可能可见（与 SSH 原生行为一致）
-- **daemon 重启后 SSH 会话需重新认证**：密码不持久化到磁盘，agent 需重新 `attach -P password`
+- **daemon 重启后 SSH 会话需重新认证**：密码不持久化到磁盘，agent 需重新 `use <name> -p password`
 - **首次主机密钥默认不自动信任**：需预先写入 `known_hosts`；仅在显式设置 `AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS=1` 时启用自动接收
 
 ## 开发

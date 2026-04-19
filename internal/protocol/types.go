@@ -63,16 +63,12 @@ type LocalParams struct {
 	Name string `json:"name,omitempty"`
 }
 
-type DetachParams struct {
-	Name string `json:"name,omitempty"`
-}
-
 type KillParams struct {
 	Name string `json:"name,omitempty"`
 }
 
-type AttachParams struct {
-	Name     string `json:"name,omitempty"`
+type UseParams struct {
+	Name     string `json:"name"`
 	Password string `json:"password,omitempty"`
 	KeyPath  string `json:"key_path,omitempty"`
 }
@@ -88,10 +84,6 @@ type LocalExecParams struct {
 	Command string      `json:"command"`
 	Timeout int         `json:"timeout,omitempty"`
 	Sudo    SudoOptions `json:"sudo,omitempty"`
-}
-
-type UseParams struct {
-	Name string `json:"name"`
 }
 
 type ForwardParams struct {

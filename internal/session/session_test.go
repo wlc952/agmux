@@ -51,11 +51,11 @@ func TestConnectLocal(t *testing.T) {
 	}
 }
 
-func TestUse(t *testing.T) {
+func TestUseLocal(t *testing.T) {
 	m := NewManager()
 	_, _ = m.ConnectLocal("local")
 
-	err := m.Use("local")
+	err := m.Use("local", "", "")
 	if err != nil {
 		t.Fatalf("Use failed: %v", err)
 	}
@@ -63,9 +63,25 @@ func TestUse(t *testing.T) {
 		t.Errorf("Default = %s, want local", m.GetDefaultName())
 	}
 
-	err = m.Use("nonexistent")
+	err = m.Use("nonexistent", "", "")
 	if err == nil {
 		t.Error("Use should fail for nonexistent session")
+	}
+}
+
+func TestUseSetsDefaultOnNewSession(t *testing.T) {
+	m := NewManager()
+
+	// First local session becomes default
+	_, _ = m.ConnectLocal("first")
+	if m.GetDefaultName() != "first" {
+		t.Errorf("Default = %s, want first", m.GetDefaultName())
+	}
+
+	// Second session also becomes default (not only when empty)
+	_, _ = m.ConnectLocal("second")
+	if m.GetDefaultName() != "second" {
+		t.Errorf("Default = %s, want second (new session should always become default)", m.GetDefaultName())
 	}
 }
 
@@ -87,22 +103,9 @@ func TestKill(t *testing.T) {
 	}
 }
 
-func TestDetachLocalFails(t *testing.T) {
-	m := NewManager()
-	_, _ = m.ConnectLocal("local")
-
-	err := m.Detach("local")
-	if err == nil {
-		t.Error("Detach should fail for local session")
-	}
-}
-
 func TestStatusConstants(t *testing.T) {
 	if StatusConnected != "connected" {
 		t.Errorf("StatusConnected = %s", StatusConnected)
-	}
-	if StatusDetached != "detached" {
-		t.Errorf("StatusDetached = %s", StatusDetached)
 	}
 	if StatusDisconnected != "disconnected" {
 		t.Errorf("StatusDisconnected = %s", StatusDisconnected)
@@ -112,5 +115,8 @@ func TestStatusConstants(t *testing.T) {
 	}
 	if StatusOffline != "offline" {
 		t.Errorf("StatusOffline = %s", StatusOffline)
+	}
+	if StatusConnecting != "connecting" {
+		t.Errorf("StatusConnecting = %s", StatusConnecting)
 	}
 }

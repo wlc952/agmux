@@ -15,7 +15,6 @@ type Status string
 
 const (
 	StatusConnected    Status = "connected"
-	StatusDetached     Status = "detached"
 	StatusDisconnected Status = "disconnected"
 	StatusReconnecting Status = "reconnecting"
 	StatusOffline      Status = "offline"
@@ -116,7 +115,18 @@ func (s *SSHSession) GetKeyPath() string {
 	return s.KeyPath
 }
 
-// GetClient returns the SSH client (for reconnect monitor).
+func (s *SSHSession) SetPassword(p string) {
+	s.mu.Lock()
+	s.Password = p
+	s.mu.Unlock()
+}
+
+func (s *SSHSession) SetKeyPath(k string) {
+	s.mu.Lock()
+	s.KeyPath = k
+	s.mu.Unlock()
+}
+
 func (s *SSHSession) GetClient() *agssh.Client {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -209,7 +219,7 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 		if sshSess, ok := existing.(*SSHSession); ok &&
 			sshSess.Host == host && sshSess.User == user && sshSess.Port == port {
 			status := sshSess.GetStatus()
-			if status == StatusConnected || status == StatusDetached || status == StatusConnecting {
+			if status == StatusConnected || status == StatusConnecting {
 				m.defaultName = name
 				m.mu.Unlock()
 				return sshSess, nil
@@ -266,9 +276,7 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 	}
 
 	m.sessions[name] = sess
-	if m.defaultName == "" {
-		m.defaultName = name
-	}
+	m.defaultName = name
 	m.mu.Unlock()
 
 	// Connect outside of Manager lock
@@ -325,103 +333,10 @@ func (m *Manager) ConnectLocal(name string) (*LocalSession, error) {
 	}
 
 	m.sessions[name] = sess
-	if m.defaultName == "" {
-		m.defaultName = name
-	}
+	m.defaultName = name
 	m.mu.Unlock()
 
 	return sess, nil
-}
-
-// Detach marks a session as detached (SSH stays alive, agent stops using it).
-func (m *Manager) Detach(name string) error {
-	if name == "" {
-		m.mu.RLock()
-		name = m.defaultName
-		m.mu.RUnlock()
-	}
-
-	m.mu.RLock()
-	sess, ok := m.sessions[name]
-	m.mu.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("session not found")
-	}
-
-	if sess.IsLocal() {
-		return fmt.Errorf("local sessions cannot be detached")
-	}
-
-	status := sess.GetStatus()
-	if status != StatusConnected {
-		return fmt.Errorf("session is not connected (status: %s)", status)
-	}
-
-	sess.SetStatus(StatusDetached)
-
-	// Clear default if this was the default session
-	m.mu.Lock()
-	if m.defaultName == name {
-		m.defaultName = ""
-	}
-	m.mu.Unlock()
-
-	return nil
-}
-
-// Attach re-attaches to a detached session.
-func (m *Manager) Attach(name, password, keyPath string) error {
-	if name == "" {
-		m.mu.RLock()
-		name = m.defaultName
-		m.mu.RUnlock()
-	}
-
-	m.mu.RLock()
-	sess, ok := m.sessions[name]
-	m.mu.RUnlock()
-
-	if !ok {
-		return fmt.Errorf("session not found")
-	}
-
-	if sess.IsLocal() {
-		// Local sessions: just set as default
-		m.mu.Lock()
-		m.defaultName = name
-		m.mu.Unlock()
-		return nil
-	}
-
-	sshSess := sess.(*SSHSession)
-	status := sshSess.GetStatus()
-
-	switch status {
-	case StatusDetached:
-		sshSess.SetStatus(StatusConnected)
-		m.mu.Lock()
-		m.defaultName = name
-		m.mu.Unlock()
-		return nil
-
-	case StatusOffline, StatusDisconnected:
-		// Need to reconnect — update credentials if provided
-		if password != "" {
-			sshSess.mu.Lock()
-			sshSess.Password = password
-			sshSess.mu.Unlock()
-		}
-		if keyPath != "" {
-			sshSess.mu.Lock()
-			sshSess.KeyPath = keyPath
-			sshSess.mu.Unlock()
-		}
-		return m.reconnectSSH(sshSess)
-
-	default:
-		return fmt.Errorf("session is not detached/offline (status: %s)", status)
-	}
 }
 
 // Kill closes a session's SSH connection and removes it from the registry.
@@ -460,17 +375,46 @@ func (m *Manager) List() []Session {
 	return result
 }
 
-// Use sets the default session.
-func (m *Manager) Use(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// Use sets the default session and reconnects if necessary.
+func (m *Manager) Use(name, password, keyPath string) error {
+	if name == "" {
+		name = m.GetDefaultName()
+	}
 
-	if _, ok := m.sessions[name]; !ok {
+	m.mu.RLock()
+	sess, ok := m.sessions[name]
+	m.mu.RUnlock()
+
+	if !ok {
 		return fmt.Errorf("session not found")
 	}
 
+	// Always set as default
+	m.mu.Lock()
 	m.defaultName = name
-	return nil
+	m.mu.Unlock()
+
+	if sess.IsLocal() {
+		return nil
+	}
+
+	sshSess := sess.(*SSHSession)
+	status := sshSess.GetStatus()
+
+	switch status {
+	case StatusConnected, StatusConnecting, StatusReconnecting:
+		return nil
+	case StatusOffline, StatusDisconnected:
+		if password != "" {
+			sshSess.SetPassword(password)
+		}
+		if keyPath != "" {
+			sshSess.SetKeyPath(keyPath)
+		}
+		return m.reconnectSSH(sshSess)
+	default:
+		return fmt.Errorf("unexpected session status: %s", status)
+	}
 }
 
 // Get returns a session by name.
@@ -566,9 +510,7 @@ func (m *Manager) reconnectSSH(sess *SSHSession) error {
 	sess.mu.Unlock()
 
 	m.mu.Lock()
-	if m.defaultName == "" {
-		m.defaultName = sess.Name
-	}
+	m.defaultName = sess.Name
 	m.mu.Unlock()
 
 	return nil

@@ -23,7 +23,7 @@ argument-hint: '请描述你的场景，例如：首次连接、执行命令、�
 - 需要从零开始的上手路径。
 - 需要连接 SSH 或创建本地会话。
 - 需要安全执行命令（sudo、超时、流式输出）。
-- 需要管理会话生命周期（list/use/detach/attach/kill）。
+- 需要管理会话生命周期（list/use/kill）。
 - 需要端口转发、SFTP/SCP 传输、重连恢复、健康检查。
 
 ## 能力地图
@@ -36,7 +36,7 @@ argument-hint: '请描述你的场景，例如：首次连接、执行命令、�
 - 通过 stdin 的安全 sudo 执行。
 - 本地与远程端口转发。
 - SCP/SFTP 文件传输。
-- detach/attach 生命周期管理与 daemon 持久化。
+- 会话切换与重连（`use` 智能切换默认，自动恢复断开的 SSH 连接）。
 - 指数退避自动重连与转发恢复。
 
 ## 工作流
@@ -76,7 +76,7 @@ agmux connect -u <user> -h <host> -n <session> -i <ssh_key_path>
 密码认证备选：
 
 ```bash
-agmux connect -u <user> -h <host> -n <session> -P <password>
+agmux connect -u <user> -h <host> -n <session> -p <password>
 ```
 
 本地会话：
@@ -85,10 +85,15 @@ agmux connect -u <user> -h <host> -n <session> -P <password>
 agmux local -n <session>
 ```
 
-可选：设置默认会话：
+可选：设置默认会话或恢复断开的会话：
 
 ```bash
+# 切换默认会话（已连接的会话仅切换默认）
 agmux use <session>
+
+# 恢复断开的会话（提供认证凭据）
+agmux use <session> -p <password>
+agmux use <session> -i <ssh_key_path>
 ```
 
 ### 4. 执行命令
@@ -163,8 +168,8 @@ agmux sftp -n <session> -c rm -p <remote_path>
 
 ```bash
 agmux list
-agmux detach -n <session>
-agmux attach -n <session>
+agmux use <session>           # 切换默认 / 恢复断开的会话
+agmux use <session> -P <pass> # 恢复离线会话（提供认证）
 agmux kill <session>
 ```
 
@@ -188,7 +193,7 @@ agmux reconnect -n <session>
 - 一次性本地命令：优先 `agmux run`。
 - 同一目标重复执行：建立会话后用 `agmux exec`。
 - 需要实时可见输出：加 `--stream`。
-- daemon 重启后 SSH 会话离线：使用 `agmux attach` 并补充密码或密钥。
+- daemon 重启后 SSH 会话离线：使用 `agmux use <session> -p <password>` 恢复连接。
 - 需要远程暴露反向转发：使用 `-R`，仅在确有必要时使用 `--public`。
 
 ## 质量标准
@@ -206,4 +211,4 @@ agmux reconnect -n <session>
 2. 最小命令序列。
 3. 可选高级变体。
 4. 验收检查清单。
-5. 下一步安全动作（detach、保持会话或清理）。
+5. 下一步安全动作（kill 会话或保持）。
