@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          ARCHIVE: ${{ matrix.archive }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          suffix=""
+          if [[ "$GOOS" == "windows" ]]; then
+            suffix=".exe"
+          fi
+
+          asset_name="agmux_${TAG}_${GOOS}_${GOARCH}"
+          workdir="dist/${asset_name}"
+          mkdir -p "${workdir}"
+
+          go build -trimpath -ldflags="-s -w -X main.version=${TAG}" -o "${workdir}/agmux${suffix}" ./cmd/agmux
+          go build -trimpath -ldflags="-s -w -X main.version=${TAG}" -o "${workdir}/agmux-server${suffix}" ./cmd/agmux-server
+
+          if [[ "$ARCHIVE" == "zip" ]]; then
+            (cd dist && zip -r "${asset_name}.zip" "${asset_name}")
+            echo "ASSET_PATH=dist/${asset_name}.zip" >> "$GITHUB_ENV"
+          else
+            tar -C dist -czf "dist/${asset_name}.tar.gz" "${asset_name}"
+            echo "ASSET_PATH=dist/${asset_name}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: ${{ env.ASSET_PATH }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
