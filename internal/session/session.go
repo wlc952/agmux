@@ -116,6 +116,20 @@ func (s *SSHSession) GetKeyPath() string {
 	return s.KeyPath
 }
 
+// GetClient returns the SSH client (for reconnect monitor).
+func (s *SSHSession) GetClient() *agssh.Client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.Client
+}
+
+// SetClient sets the SSH client (for reconnect monitor).
+func (s *SSHSession) SetClient(client *agssh.Client) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Client = client
+}
+
 // LocalSession represents a local execution session.
 type LocalSession struct {
 	Name      string
@@ -491,6 +505,23 @@ func (m *Manager) KillAll() {
 	for _, s := range sessions {
 		s.Close()
 	}
+}
+
+// RegisterOfflineSession adds an SSH session in offline state (for state restoration).
+func (m *Manager) RegisterOfflineSession(name, user, host string, port int, keyPath string, createdAt time.Time) {
+	sess := &SSHSession{
+		Name:      name,
+		Host:      host,
+		User:      user,
+		Port:      port,
+		KeyPath:   keyPath,
+		Status:    StatusOffline,
+		CreatedAt: createdAt,
+	}
+
+	m.mu.Lock()
+	m.sessions[name] = sess
+	m.mu.Unlock()
 }
 
 // --- Internal helpers ---

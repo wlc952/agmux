@@ -60,7 +60,7 @@ func WriteMessage(w io.Writer, msg *Imsg) error {
 	}
 
 	header := make([]byte, HeaderSize)
-	header[0] = Version
+	header[0] = msg.Version
 	binary.BigEndian.PutUint16(header[1:3], msg.Type)
 	binary.BigEndian.PutUint32(header[3:7], uint32(len(msg.Payload)))
 
