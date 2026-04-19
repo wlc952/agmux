@@ -1,11 +1,11 @@
 package exec
 
 import (
+	"bytes"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
-	"path/filepath"
+	"sync"
 	"time"
 
 	"agmux/internal/protocol"
@@ -96,8 +96,12 @@ func runRemoteNormal(sshSession *ssh.Session, fullCmd string, timeout int) (*pro
 			return
 		}
 
-		stdoutBuf, _ := io.ReadAll(stdoutPipe)
-		stderrBuf, _ := io.ReadAll(stderrPipe)
+		stdoutBuf, stderrBuf, err := readPipes(stdoutPipe, stderrPipe)
+		if err != nil {
+			done <- execResult{stdoutBuf, stderrBuf, err}
+			return
+		}
+
 		err = sshSession.Wait()
 		done <- execResult{stdoutBuf, stderrBuf, err}
 	}()
@@ -114,16 +118,7 @@ func runRemoteNormal(sshSession *ssh.Session, fullCmd string, timeout int) (*pro
 }
 
 func runRemoteSudo(sshSession *ssh.Session, fullCmd string, sudoOpts *protocol.SudoOptions, timeout int) (*protocol.ExecResult, error) {
-	askpassPath, cleanup, err := createAskpassHelper(sudoOpts.Password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create askpass helper: %w", err)
-	}
-	defer cleanup()
-
-	sudoPrefix := buildSudoPrefix(sudoOpts)
-	envVars := fmt.Sprintf("SUDO_ASKPASS=%s", askpassPath)
-	sudoCmd := fmt.Sprintf("%s -A %s", sudoPrefix, fullCmd)
-	wrappedCmd := fmt.Sprintf("/bin/sh -c %q", fmt.Sprintf("env %s %s", envVars, sudoCmd))
+	wrappedCmd := buildSudoCommand(fullCmd, sudoOpts)
 
 	done := make(chan execResult, 1)
 
@@ -138,14 +133,28 @@ func runRemoteSudo(sshSession *ssh.Session, fullCmd string, sudoOpts *protocol.S
 			done <- execResult{nil, nil, err}
 			return
 		}
+		stdinPipe, err := sshSession.StdinPipe()
+		if err != nil {
+			done <- execResult{nil, nil, err}
+			return
+		}
 
 		if err := sshSession.Start(wrappedCmd); err != nil {
 			done <- execResult{nil, nil, err}
 			return
 		}
 
-		stdoutBuf, _ := io.ReadAll(stdoutPipe)
-		stderrBuf, _ := io.ReadAll(stderrPipe)
+		if err := writePassword(stdinPipe, sudoOpts.Password); err != nil {
+			done <- execResult{nil, nil, err}
+			return
+		}
+
+		stdoutBuf, stderrBuf, err := readPipes(stdoutPipe, stderrPipe)
+		if err != nil {
+			done <- execResult{stdoutBuf, stderrBuf, err}
+			return
+		}
+
 		err = sshSession.Wait()
 		done <- execResult{stdoutBuf, stderrBuf, err}
 	}()
@@ -155,7 +164,6 @@ func runRemoteSudo(sshSession *ssh.Session, fullCmd string, sudoOpts *protocol.S
 		sshSession.Signal(ssh.SIGKILL)
 		sshSession.Close()
 		<-done
-		cleanup()
 		return &protocol.ExecResult{Stdout: "", Stderr: "", ExitCode: -1}, fmt.Errorf("command timed out")
 	}
 
@@ -196,8 +204,12 @@ func runLocalNormal(fullCmd string, timeout int) (*protocol.ExecResult, error) {
 			return
 		}
 
-		stdoutBuf, _ := io.ReadAll(stdoutPipe)
-		stderrBuf, _ := io.ReadAll(stderrPipe)
+		stdoutBuf, stderrBuf, err := readPipes(stdoutPipe, stderrPipe)
+		if err != nil {
+			done <- execResult{stdoutBuf, stderrBuf, err}
+			return
+		}
+
 		err = cmd.Wait()
 		done <- execResult{stdoutBuf, stderrBuf, err}
 	}()
@@ -213,17 +225,9 @@ func runLocalNormal(fullCmd string, timeout int) (*protocol.ExecResult, error) {
 }
 
 func runLocalSudo(fullCmd string, sudoOpts *protocol.SudoOptions, timeout int) (*protocol.ExecResult, error) {
-	askpassPath, cleanup, err := createAskpassHelper(sudoOpts.Password)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create askpass helper: %w", err)
-	}
-	defer cleanup()
-
-	sudoPrefix := buildSudoPrefix(sudoOpts)
-	sudoCmd := fmt.Sprintf("%s -A %s", sudoPrefix, fullCmd)
+	sudoCmd := buildSudoCommand(fullCmd, sudoOpts)
 
 	cmd := exec.Command("/bin/sh", "-c", sudoCmd)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("SUDO_ASKPASS=%s", askpassPath))
 
 	done := make(chan execResult, 1)
 
@@ -238,14 +242,28 @@ func runLocalSudo(fullCmd string, sudoOpts *protocol.SudoOptions, timeout int) (
 			done <- execResult{nil, nil, err}
 			return
 		}
+		stdinPipe, err := cmd.StdinPipe()
+		if err != nil {
+			done <- execResult{nil, nil, err}
+			return
+		}
 
 		if err := cmd.Start(); err != nil {
 			done <- execResult{nil, nil, err}
 			return
 		}
 
-		stdoutBuf, _ := io.ReadAll(stdoutPipe)
-		stderrBuf, _ := io.ReadAll(stderrPipe)
+		if err := writePassword(stdinPipe, sudoOpts.Password); err != nil {
+			done <- execResult{nil, nil, err}
+			return
+		}
+
+		stdoutBuf, stderrBuf, err := readPipes(stdoutPipe, stderrPipe)
+		if err != nil {
+			done <- execResult{stdoutBuf, stderrBuf, err}
+			return
+		}
+
 		err = cmd.Wait()
 		done <- execResult{stdoutBuf, stderrBuf, err}
 	}()
@@ -254,7 +272,6 @@ func runLocalSudo(fullCmd string, sudoOpts *protocol.SudoOptions, timeout int) (
 	if timedOut {
 		cmd.Process.Kill()
 		<-done
-		cleanup()
 		return &protocol.ExecResult{Stdout: "", Stderr: "", ExitCode: -1}, fmt.Errorf("command timed out")
 	}
 
@@ -263,26 +280,18 @@ func runLocalSudo(fullCmd string, sudoOpts *protocol.SudoOptions, timeout int) (
 
 // --- Sudo helpers (safe, no shell injection) ---
 
-// createAskpassHelper creates a temporary shell script that echoes the sudo password.
-// Uses SUDO_ASKPASS mechanism instead of shell concatenation — no injection risk.
-func createAskpassHelper(password string) (path string, cleanup func(), err error) {
+func writePassword(stdin io.WriteCloser, password string) error {
+	defer stdin.Close()
+
 	if password == "" {
-		return "", func() {}, nil
+		return nil
 	}
 
-	tmpDir := os.TempDir()
-	scriptPath := filepath.Join(tmpDir, fmt.Sprintf("agmux-askpass-%d", time.Now().UnixNano()))
-
-	content := fmt.Sprintf("#!/bin/sh\nprintf '%s\\n'\n", password)
-	if err := os.WriteFile(scriptPath, []byte(content), 0700); err != nil {
-		return "", func() {}, fmt.Errorf("failed to write askpass script: %w", err)
+	if _, err := io.WriteString(stdin, password+"\n"); err != nil {
+		return fmt.Errorf("failed to write sudo password: %w", err)
 	}
 
-	cleanup = func() {
-		os.Remove(scriptPath)
-	}
-
-	return scriptPath, cleanup, nil
+	return nil
 }
 
 func buildSudoPrefix(sudoOpts *protocol.SudoOptions) string {
@@ -293,6 +302,50 @@ func buildSudoPrefix(sudoOpts *protocol.SudoOptions) string {
 		return fmt.Sprintf("sudo -u %s", sudoOpts.User)
 	}
 	return "sudo"
+}
+
+func buildSudoCommand(fullCmd string, sudoOpts *protocol.SudoOptions) string {
+	return fmt.Sprintf("%s -S -p '' %s", buildSudoPrefix(sudoOpts), fullCmd)
+}
+
+func readPipes(stdoutPipe, stderrPipe io.Reader) ([]byte, []byte, error) {
+	type readResult struct {
+		stream string
+		data   []byte
+		err    error
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan readResult, 2)
+
+	read := func(stream string, r io.Reader) {
+		defer wg.Done()
+		data, err := io.ReadAll(r)
+		results <- readResult{stream: stream, data: data, err: err}
+	}
+
+	wg.Add(2)
+	go read("stdout", stdoutPipe)
+	go read("stderr", stderrPipe)
+	wg.Wait()
+	close(results)
+
+	var stdoutBuf []byte
+	var stderrBuf []byte
+	var readErr error
+
+	for result := range results {
+		if result.stream == "stdout" {
+			stdoutBuf = result.data
+		} else {
+			stderrBuf = result.data
+		}
+		if readErr == nil && result.err != nil {
+			readErr = result.err
+		}
+	}
+
+	return stdoutBuf, stderrBuf, readErr
 }
 
 // --- Result processing helpers ---
@@ -317,9 +370,13 @@ func sshExecResult(res execResult) *protocol.ExecResult {
 func localExecResult(res execResult) *protocol.ExecResult {
 	if res.err != nil {
 		if exitErr, ok := res.err.(*exec.ExitError); ok {
+			stderr := res.stderr
+			if len(exitErr.Stderr) > 0 {
+				stderr = append(stderr, exitErr.Stderr...)
+			}
 			return &protocol.ExecResult{
 				Stdout:   string(res.stdout),
-				Stderr:   string(res.stderr) + string(exitErr.Stderr),
+				Stderr:   string(bytes.Clone(stderr)),
 				ExitCode: exitErr.ExitCode(),
 			}
 		}

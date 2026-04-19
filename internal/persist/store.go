@@ -62,7 +62,7 @@ func (s *Store) Load() ([]SessionState, error) {
 
 // SessionToState converts a session to its persistable state.
 func SessionToState(sess session.Session) SessionState {
-	return SessionState{
+	state := SessionState{
 		Name:      sess.GetName(),
 		Type:      sess.GetType(),
 		Host:      sess.GetHost(),
@@ -70,6 +70,14 @@ func SessionToState(sess session.Session) SessionState {
 		Status:    string(sess.GetStatus()),
 		CreatedAt: sess.GetCreatedAt().Unix(),
 	}
+
+	if !sess.IsLocal() {
+		sshSess := sess.(*session.SSHSession)
+		state.Port = sshSess.Port
+		state.KeyPath = sshSess.GetKeyPath()
+	}
+
+	return state
 }
 
 // CollectState collects state from all active sessions.

@@ -303,7 +303,7 @@ func handleExec(args []string) error {
 	if fs.NArg() < 1 {
 		return fmt.Errorf("command required")
 	}
-	command := strings.Join(fs.Args(), "")
+	command := joinCommandArgs(fs.Args())
 
 	sudoOpts := protocol.SudoOptions{
 		Enabled:  *useSudo,
@@ -356,7 +356,7 @@ func handleRun(args []string) error {
 	if fs.NArg() < 1 {
 		return fmt.Errorf("command required")
 	}
-	command := strings.Join(fs.Args(), " ")
+	command := joinCommandArgs(fs.Args())
 
 	sudoOpts := protocol.SudoOptions{
 		Enabled:  *useSudo,
@@ -391,6 +391,10 @@ func handleRun(args []string) error {
 	}
 
 	return nil
+}
+
+func joinCommandArgs(args []string) string {
+	return strings.Join(args, " ")
 }
 
 func handleList() error {

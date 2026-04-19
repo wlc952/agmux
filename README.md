@@ -13,7 +13,7 @@ agmux 是一个为 AI Agent 设计的 SSH/本地会话管理和命令执行工�
 - TCP 端口转发（本地/远程）
 - 断线自动重连（指数退避：5s → 10s → 20s → ... → max 5min）
 - SFTP 文件传输（上传/下载/同步）
-- Sudo 安全执行（SUDO_ASKPASS，无 shell 注入风险）
+- Sudo 安全执行（`sudo -S` + stdin，无 shell 注入风险）
 - Unix Socket 0600 认证（与 tmux 相同模型）
 - 审计日志（`~/.agmux/audit.log`）
 - 状态持久化（daemon 重启可恢复会话）
@@ -239,7 +239,6 @@ agmux/
 
 - **不支持交互式命令**：vim、less、top 等需要 TTY 的程序无法使用
 - **密码暴露**：密码通过命令行传递，在 `ps aux` 中可能可见（与 SSH 原生行为一致）
-- **密码不能包含 `printf` 格式字符**：`--sudo-password` 中包含 `%` 等字符会影响 askpass 脚本
 - **daemon 重启后 SSH 会话需重新认证**：密码不持久化到磁盘，agent 需重新 `attach -P password`
 
 ## 开发

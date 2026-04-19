@@ -55,7 +55,7 @@ agmux/
 │   │   ├── executor.go             # Command execution for both SSH and local
 │   │   ├── local.go                # Local command execution
 │   │   ├── remote.go               # Remote (SSH) command execution
-│   │   ├── sudo.go                 # Sudo via ASKPASS helper
+│   │   ├── sudo.go                 # Sudo via stdin helper
 │   │   ├── executor_test.go
 │   ├── portforward/
 │   │   ├── forwarder.go            # Local/remote port forwarder
@@ -338,14 +338,13 @@ type SudoOptions struct {
     Login    bool     // -i login shell
 }
 
-// Implementation: ASKPASS helper
-// 1. Create temp file with shell script: echo '<password>'
-//    (script has 0700 permissions, deleted after exec)
-// 2. Set SUDO_ASKPASS env var to the temp script path
-// 3. Run sudo -A <command>
-// 4. Delete temp file
+// Implementation: sudo -S via stdin
+// 1. Build sudo command with -S -p ''
+// 2. Start command
+// 3. Write password + "\n" to stdin
+// 4. Close stdin and wait for completion
 
-func createAskpassHelper(password string) (path string, cleanup func(), err error)
+func writePassword(stdin io.WriteCloser, password string) error
 func buildSudoCommand(sudoOpts *SudoOptions, command string) string
 ```
 
@@ -506,7 +505,7 @@ func (l *Logger) Log(entry Entry) error   // Append one JSON line
 ## 12. Security
 
 1. **Socket auth**: Unix socket with `0600` permissions. Only the OS user who started the daemon can connect. Same model as tmux.
-2. **Sudo safety**: Password via SUDO_ASKPASS temp helper (0700 permissions, deleted after exec). Never shell-concatenated.
+2. **Sudo safety**: Password via `sudo -S` stdin write. Never shell-concatenated.
 3. **Password handling**: Not persisted to disk. In memory only during session lifetime.
 4. **Path traversal**: `filepath.IsLocal()` check for SFTP downloads.
 5. **Audit log**: Every action logged to `~/.agmux/audit.log`.

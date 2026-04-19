@@ -1,8 +1,8 @@
 package exec
 
 import (
+	"io"
 	"os"
-	"os/exec"
 	"testing"
 
 	"agmux/internal/protocol"
@@ -89,34 +89,83 @@ func TestBuildSudoPrefix(t *testing.T) {
 	}
 }
 
-func TestCreateAskpassHelper(t *testing.T) {
-	path, cleanup, err := createAskpassHelper("testpass123")
-	if err != nil {
-		t.Fatalf("createAskpassHelper failed: %v", err)
+func TestBuildSudoCommand(t *testing.T) {
+	tests := []struct {
+		name string
+		opts *protocol.SudoOptions
+		want string
+	}{
+		{name: "default", opts: &protocol.SudoOptions{}, want: "sudo -S -p '' /bin/sh -c \"echo hi\""},
+		{name: "login", opts: &protocol.SudoOptions{Login: true}, want: "sudo -i -S -p '' /bin/sh -c \"echo hi\""},
+		{name: "user", opts: &protocol.SudoOptions{User: "www-data"}, want: "sudo -u www-data -S -p '' /bin/sh -c \"echo hi\""},
 	}
 
-	// Verify script outputs the password
-	out, err := exec.Command(path).Output()
-	if err != nil {
-		t.Errorf("askpass script failed: %v", err)
-	}
-	if string(out) != "testpass123\n" {
-		t.Errorf("askpass output = %q, want \"testpass123\\n\"", string(out))
-	}
-
-	cleanup()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Error("askpass script not deleted after cleanup")
+	for _, tt := range tests {
+		if got := buildSudoCommand("/bin/sh -c \"echo hi\"", tt.opts); got != tt.want {
+			t.Fatalf("%s: buildSudoCommand() = %q, want %q", tt.name, got, tt.want)
+		}
 	}
 }
 
-func TestCreateAskpassHelperEmptyPassword(t *testing.T) {
-	path, cleanup, err := createAskpassHelper("")
+func TestWritePassword(t *testing.T) {
+	reader, writer, err := os.Pipe()
 	if err != nil {
-		t.Fatalf("createAskpassHelper with empty password failed: %v", err)
+		t.Fatalf("os.Pipe failed: %v", err)
 	}
-	if path != "" {
-		t.Errorf("expected empty path for empty password, got %s", path)
+
+	done := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(reader)
+		done <- data
+	}()
+
+	password := "pa'ss%word"
+	if err := writePassword(writer, password); err != nil {
+		t.Fatalf("writePassword failed: %v", err)
 	}
-	cleanup()
+
+	got := <-done
+	want := password + "\n"
+	if string(got) != want {
+		t.Fatalf("writePassword() = %q, want %q", string(got), want)
+	}
+}
+
+func TestWritePasswordEmptyPassword(t *testing.T) {
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+
+	done := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(reader)
+		done <- data
+	}()
+
+	if err := writePassword(writer, ""); err != nil {
+		t.Fatalf("writePassword failed: %v", err)
+	}
+
+	if got := <-done; len(got) != 0 {
+		t.Fatalf("writePassword() wrote %q, want empty", string(got))
+	}
+}
+
+func TestLocalExecLargeStderrDoesNotHang(t *testing.T) {
+	e := NewExecutor(nil)
+
+	result, err := e.ExecLocal("yes x | head -c 131072 >&2; echo ok", 5, nil)
+	if err != nil {
+		t.Fatalf("ExecLocal failed: %v", err)
+	}
+	if result.Stdout != "ok\n" {
+		t.Fatalf("Stdout = %q, want %q", result.Stdout, "ok\n")
+	}
+	if len(result.Stderr) < 131072 {
+		t.Fatalf("len(Stderr) = %d, want at least 131072", len(result.Stderr))
+	}
+	if result.ExitCode != 0 {
+		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
+	}
 }
