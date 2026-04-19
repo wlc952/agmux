@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"testing"
@@ -167,5 +168,76 @@ func TestLocalExecLargeStderrDoesNotHang(t *testing.T) {
 	}
 	if result.ExitCode != 0 {
 		t.Fatalf("ExitCode = %d, want 0", result.ExitCode)
+	}
+}
+
+func TestExecLocalStreamSimple(t *testing.T) {
+	e := NewExecutor(nil)
+
+	var stdout, stderr bytes.Buffer
+	exitCode, err := e.ExecLocalStream("echo hello", 0, nil, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("ExecLocalStream failed: %v", err)
+	}
+	if stdout.String() != "hello\n" {
+		t.Errorf("stdout = %q, want %q", stdout.String(), "hello\n")
+	}
+	if exitCode != 0 {
+		t.Errorf("exitCode = %d, want 0", exitCode)
+	}
+}
+
+func TestExecLocalStreamStderr(t *testing.T) {
+	e := NewExecutor(nil)
+
+	var stdout, stderr bytes.Buffer
+	_, err := e.ExecLocalStream("echo err >&2", 0, nil, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("ExecLocalStream failed: %v", err)
+	}
+	if stderr.String() != "err\n" {
+		t.Errorf("stderr = %q, want %q", stderr.String(), "err\n")
+	}
+}
+
+func TestExecLocalStreamExitCode(t *testing.T) {
+	e := NewExecutor(nil)
+
+	var stdout, stderr bytes.Buffer
+	exitCode, err := e.ExecLocalStream("exit 7", 0, nil, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("ExecLocalStream failed: %v", err)
+	}
+	if exitCode != 7 {
+		t.Errorf("exitCode = %d, want 7", exitCode)
+	}
+}
+
+func TestExecLocalStreamTimeout(t *testing.T) {
+	e := NewExecutor(nil)
+
+	var stdout, stderr bytes.Buffer
+	exitCode, err := e.ExecLocalStream("sleep 10", 1, nil, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if exitCode != -1 {
+		t.Errorf("exitCode = %d, want -1 (timeout)", exitCode)
+	}
+}
+
+func TestExecLocalStreamPipe(t *testing.T) {
+	e := NewExecutor(nil)
+
+	var stdout, stderr bytes.Buffer
+	exitCode, err := e.ExecLocalStream("echo hello | tr h H", 0, nil, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("ExecLocalStream pipe failed: %v", err)
+	}
+	if stdout.String() != "Hello\n" {
+		t.Errorf("stdout = %q, want %q", stdout.String(), "Hello\n")
+	}
+	if exitCode != 0 {
+		t.Errorf("exitCode = %d, want 0", exitCode)
 	}
 }

@@ -58,7 +58,261 @@ func (e *Executor) ExecLocal(command string, timeout int, sudoOpts *protocol.Sud
 	return runLocal(command, timeout, sudoOpts)
 }
 
-// --- Remote execution ---
+// streamExecResult holds the result of a streaming command execution.
+type streamExecResult struct {
+	exitCode int
+	err      error
+}
+
+// ExecStream executes a command in the specified session, streaming stdout/stderr
+// to the provided writers as output arrives.
+// Returns the exit code and any fatal (non-exit-status) error.
+func (e *Executor) ExecStream(sessionName, command string, timeout int, sudoOpts *protocol.SudoOptions, stdoutW, stderrW io.Writer) (int, error) {
+	sess, err := e.sessions.Get(sessionName)
+	if err != nil {
+		return 1, err
+	}
+
+	sess.SetLastCmd(command)
+
+	if sess.IsLocal() {
+		return runLocalStream(command, timeout, sudoOpts, stdoutW, stderrW)
+	}
+
+	sshSess := sess.(*session.SSHSession)
+	sshClient := sshSess.GetSSHClient()
+	if sshClient == nil {
+		return 1, fmt.Errorf("session not connected")
+	}
+
+	return runRemoteStream(sshClient, command, timeout, sudoOpts, stdoutW, stderrW)
+}
+
+// ExecLocalStream executes a one-off local command with streaming output (no session needed).
+func (e *Executor) ExecLocalStream(command string, timeout int, sudoOpts *protocol.SudoOptions, stdoutW, stderrW io.Writer) (int, error) {
+	return runLocalStream(command, timeout, sudoOpts, stdoutW, stderrW)
+}
+
+// --- Remote streaming execution ---
+
+func runRemoteStream(client *ssh.Client, command string, timeout int, sudoOpts *protocol.SudoOptions, stdoutW, stderrW io.Writer) (int, error) {
+	sshSession, err := client.NewSession()
+	if err != nil {
+		return 1, fmt.Errorf("failed to create SSH session: %w", err)
+	}
+	defer sshSession.Close()
+
+	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
+
+	if sudoOpts != nil && sudoOpts.Enabled {
+		return runRemoteSudoStream(sshSession, fullCmd, sudoOpts, timeout, stdoutW, stderrW)
+	}
+
+	return runRemoteNormalStream(sshSession, fullCmd, timeout, stdoutW, stderrW)
+}
+
+func runRemoteNormalStream(sshSession *ssh.Session, fullCmd string, timeout int, stdoutW, stderrW io.Writer) (int, error) {
+	stdoutPipe, err := sshSession.StdoutPipe()
+	if err != nil {
+		return 1, err
+	}
+	stderrPipe, err := sshSession.StderrPipe()
+	if err != nil {
+		return 1, err
+	}
+
+	if err := sshSession.Start(fullCmd); err != nil {
+		return 1, err
+	}
+
+	done := make(chan streamExecResult, 1)
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); io.Copy(stdoutW, stdoutPipe) }()
+		go func() { defer wg.Done(); io.Copy(stderrW, stderrPipe) }()
+		wg.Wait()
+
+		code, exitErr := sshExitCode(sshSession.Wait())
+		done <- streamExecResult{exitCode: code, err: exitErr}
+	}()
+
+	return waitStreamTimeout(done, sshSession, nil, timeout)
+}
+
+func runRemoteSudoStream(sshSession *ssh.Session, fullCmd string, sudoOpts *protocol.SudoOptions, timeout int, stdoutW, stderrW io.Writer) (int, error) {
+	wrappedCmd := buildSudoCommand(fullCmd, sudoOpts)
+
+	stdoutPipe, err := sshSession.StdoutPipe()
+	if err != nil {
+		return 1, err
+	}
+	stderrPipe, err := sshSession.StderrPipe()
+	if err != nil {
+		return 1, err
+	}
+	stdinPipe, err := sshSession.StdinPipe()
+	if err != nil {
+		return 1, err
+	}
+
+	if err := sshSession.Start(wrappedCmd); err != nil {
+		return 1, err
+	}
+
+	if err := writePassword(stdinPipe, sudoOpts.Password); err != nil {
+		return 1, err
+	}
+
+	done := make(chan streamExecResult, 1)
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); io.Copy(stdoutW, stdoutPipe) }()
+		go func() { defer wg.Done(); io.Copy(stderrW, stderrPipe) }()
+		wg.Wait()
+
+		code, exitErr := sshExitCode(sshSession.Wait())
+		done <- streamExecResult{exitCode: code, err: exitErr}
+	}()
+
+	return waitStreamTimeout(done, sshSession, nil, timeout)
+}
+
+// sshExitCode normalises the error returned by ssh.Session.Wait:
+// a non-zero exit is not a fatal error — it is returned as an exit code.
+func sshExitCode(err error) (int, error) {
+	if err == nil {
+		return 0, nil
+	}
+	if exitErr, ok := err.(*ssh.ExitError); ok {
+		return exitErr.ExitStatus(), nil
+	}
+	return 1, err
+}
+
+// --- Local streaming execution ---
+
+func runLocalStream(command string, timeout int, sudoOpts *protocol.SudoOptions, stdoutW, stderrW io.Writer) (int, error) {
+	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
+
+	if sudoOpts != nil && sudoOpts.Enabled {
+		return runLocalSudoStream(fullCmd, sudoOpts, timeout, stdoutW, stderrW)
+	}
+
+	return runLocalNormalStream(fullCmd, timeout, stdoutW, stderrW)
+}
+
+func runLocalNormalStream(fullCmd string, timeout int, stdoutW, stderrW io.Writer) (int, error) {
+	cmd := exec.Command("/bin/sh", "-c", fullCmd)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return 1, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return 1, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return 1, err
+	}
+
+	done := make(chan streamExecResult, 1)
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); io.Copy(stdoutW, stdoutPipe) }()
+		go func() { defer wg.Done(); io.Copy(stderrW, stderrPipe) }()
+		wg.Wait()
+
+		code, exitErr := localExitCode(cmd.Wait())
+		done <- streamExecResult{exitCode: code, err: exitErr}
+	}()
+
+	return waitStreamTimeout(done, nil, cmd, timeout)
+}
+
+func runLocalSudoStream(fullCmd string, sudoOpts *protocol.SudoOptions, timeout int, stdoutW, stderrW io.Writer) (int, error) {
+	sudoCmd := buildSudoCommand(fullCmd, sudoOpts)
+	cmd := exec.Command("/bin/sh", "-c", sudoCmd)
+
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return 1, err
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return 1, err
+	}
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return 1, err
+	}
+
+	if err := cmd.Start(); err != nil {
+		return 1, err
+	}
+
+	if err := writePassword(stdinPipe, sudoOpts.Password); err != nil {
+		return 1, err
+	}
+
+	done := make(chan streamExecResult, 1)
+	go func() {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); io.Copy(stdoutW, stdoutPipe) }()
+		go func() { defer wg.Done(); io.Copy(stderrW, stderrPipe) }()
+		wg.Wait()
+
+		code, exitErr := localExitCode(cmd.Wait())
+		done <- streamExecResult{exitCode: code, err: exitErr}
+	}()
+
+	return waitStreamTimeout(done, nil, cmd, timeout)
+}
+
+// localExitCode normalises the error returned by cmd.Wait for local processes.
+func localExitCode(err error) (int, error) {
+	if err == nil {
+		return 0, nil
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr.ExitCode(), nil
+	}
+	return 1, err
+}
+
+// waitStreamTimeout waits for a streaming goroutine to finish, applying an
+// optional timeout.  sshSession / cmd are used to forcefully stop the process
+// on timeout; pass nil for the one that does not apply.
+func waitStreamTimeout(done <-chan streamExecResult, sshSession *ssh.Session, cmd *exec.Cmd, timeout int) (int, error) {
+	if timeout <= 0 {
+		res := <-done
+		return res.exitCode, res.err
+	}
+
+	timer := time.NewTimer(time.Duration(timeout) * time.Second)
+	defer timer.Stop()
+
+	select {
+	case res := <-done:
+		return res.exitCode, res.err
+	case <-timer.C:
+		if sshSession != nil {
+			sshSession.Signal(ssh.SIGKILL)
+			sshSession.Close()
+		}
+		if cmd != nil && cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		<-done
+		return -1, fmt.Errorf("command timed out")
+	}
+}
+
 
 func runRemote(client *ssh.Client, command string, timeout int, sudoOpts *protocol.SudoOptions) (*protocol.ExecResult, error) {
 	sshSession, err := client.NewSession()

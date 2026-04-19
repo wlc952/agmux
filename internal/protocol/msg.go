@@ -19,13 +19,18 @@ const (
 	MsgSFTPMkdir    uint16 = 15 // SFTP mkdir
 	MsgSFTPRm       uint16 = 16 // SFTP remove
 	MsgReconnect    uint16 = 17 // Force reconnect
-	MsgPing         uint16 = 18 // Health check
-	MsgStop         uint16 = 19 // Stop daemon
+	MsgPing            uint16 = 18 // Health check
+	MsgStop            uint16 = 19 // Stop daemon
+	MsgExecStream      uint16 = 20 // Execute command with streaming output
+	MsgLocalExecStream uint16 = 21 // One-off local exec with streaming output
 )
+
 
 // Message types: Server → Client (responses)
 const (
-	MsgResult uint16 = 100 // Success result
-	MsgError  uint16 = 101 // Error response
-	MsgPong   uint16 = 102 // Ping response
+	MsgResult     uint16 = 100 // Success result
+	MsgError      uint16 = 101 // Error response
+	MsgPong       uint16 = 102 // Ping response
+	MsgStreamChunk uint16 = 103 // Streaming output chunk
+	MsgStreamEnd   uint16 = 104 // End of streaming output (includes exit code)
 )

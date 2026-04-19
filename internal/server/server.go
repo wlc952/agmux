@@ -186,6 +186,30 @@ func (s *Server) handleConn(conn net.Conn) {
 			return // connection closed or error
 		}
 
+		// Streaming exec: the handler writes multiple frames directly to conn
+		// before returning, so it bypasses the single-response dispatch loop.
+		if msg.Type == protocol.MsgExecStream {
+			var params protocol.ExecParams
+			if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
+				errPayload, _ := json.Marshal(protocol.ErrorPayload{Code: -32000, Message: err.Error()})
+				imsg.WriteMessage(conn, imsg.NewImsg(protocol.MsgError, errPayload))
+			} else {
+				s.handleExecStream(conn, params)
+			}
+			continue
+		}
+
+		if msg.Type == protocol.MsgLocalExecStream {
+			var params protocol.LocalExecParams
+			if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
+				errPayload, _ := json.Marshal(protocol.ErrorPayload{Code: -32000, Message: err.Error()})
+				imsg.WriteMessage(conn, imsg.NewImsg(protocol.MsgError, errPayload))
+			} else {
+				s.handleLocalExecStream(conn, params)
+			}
+			continue
+		}
+
 		response, err := s.dispatch(msg)
 		if err != nil {
 			// Send error response
@@ -537,4 +561,60 @@ func (s *Server) closeActiveConns() {
 	for _, conn := range conns {
 		conn.Close()
 	}
+}
+
+// chunkWriter is an io.Writer that sends each Write call as a MsgStreamChunk
+// frame over the connection.  stdout and stderr share the same mutex so that
+// their frames never interleave on the wire.
+type chunkWriter struct {
+	conn   net.Conn
+	stream string
+	mu     *sync.Mutex
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	chunk := protocol.StreamChunk{
+		Stream: w.stream,
+		Data:   p,
+	}
+	payload, err := protocol.EncodePayload(chunk)
+	if err != nil {
+		return 0, err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := imsg.WriteMessage(w.conn, imsg.NewImsg(protocol.MsgStreamChunk, payload)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// sendStreamEnd writes a MsgStreamEnd frame to the connection.
+func sendStreamEnd(conn net.Conn, exitCode int, execErr error) {
+	end := protocol.StreamEnd{ExitCode: exitCode}
+	if execErr != nil {
+		end.Error = execErr.Error()
+	}
+	payload, _ := protocol.EncodePayload(end)
+	imsg.WriteMessage(conn, imsg.NewImsg(protocol.MsgStreamEnd, payload))
+}
+
+func (s *Server) handleExecStream(conn net.Conn, params protocol.ExecParams) {
+	mu := &sync.Mutex{}
+	stdoutW := &chunkWriter{conn: conn, stream: "stdout", mu: mu}
+	stderrW := &chunkWriter{conn: conn, stream: "stderr", mu: mu}
+
+	exitCode, execErr := s.executor.ExecStream(params.Name, params.Command, params.Timeout, &params.Sudo, stdoutW, stderrW)
+	s.logExecAudit(params.Name, params.Command, execErr, &protocol.ExecResult{ExitCode: exitCode})
+	sendStreamEnd(conn, exitCode, execErr)
+}
+
+func (s *Server) handleLocalExecStream(conn net.Conn, params protocol.LocalExecParams) {
+	mu := &sync.Mutex{}
+	stdoutW := &chunkWriter{conn: conn, stream: "stdout", mu: mu}
+	stderrW := &chunkWriter{conn: conn, stream: "stderr", mu: mu}
+
+	exitCode, execErr := s.executor.ExecLocalStream(params.Command, params.Timeout, &params.Sudo, stdoutW, stderrW)
+	s.logExecAudit("", params.Command, execErr, &protocol.ExecResult{ExitCode: exitCode})
+	sendStreamEnd(conn, exitCode, execErr)
 }
