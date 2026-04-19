@@ -14,18 +14,18 @@ import (
 type Status string
 
 const (
-	StatusConnected     Status = "connected"
-	StatusDetached      Status = "detached"
-	StatusDisconnected  Status = "disconnected"
-	StatusReconnecting  Status = "reconnecting"
-	StatusOffline       Status = "offline"
-	StatusConnecting    Status = "connecting"
+	StatusConnected    Status = "connected"
+	StatusDetached     Status = "detached"
+	StatusDisconnected Status = "disconnected"
+	StatusReconnecting Status = "reconnecting"
+	StatusOffline      Status = "offline"
+	StatusConnecting   Status = "connecting"
 )
 
 // Session is the common interface for both SSH and local sessions.
 type Session interface {
 	GetName() string
-	GetType() string    // "ssh" or "local"
+	GetType() string // "ssh" or "local"
 	GetHost() string
 	GetUser() string
 	GetStatus() Status
@@ -52,11 +52,11 @@ type SSHSession struct {
 	mu        sync.RWMutex
 }
 
-func (s *SSHSession) GetName() string     { return s.Name }
-func (s *SSHSession) GetType() string     { return "ssh" }
-func (s *SSHSession) GetHost() string     { return s.Host }
-func (s *SSHSession) GetUser() string     { return s.User }
-func (s *SSHSession) IsLocal() bool       { return false }
+func (s *SSHSession) GetName() string         { return s.Name }
+func (s *SSHSession) GetType() string         { return "ssh" }
+func (s *SSHSession) GetHost() string         { return s.Host }
+func (s *SSHSession) GetUser() string         { return s.User }
+func (s *SSHSession) IsLocal() bool           { return false }
 func (s *SSHSession) GetCreatedAt() time.Time { return s.CreatedAt }
 
 func (s *SSHSession) GetStatus() Status {
@@ -141,11 +141,11 @@ type LocalSession struct {
 	mu        sync.RWMutex
 }
 
-func (s *LocalSession) GetName() string     { return s.Name }
-func (s *LocalSession) GetType() string     { return "local" }
-func (s *LocalSession) GetHost() string     { return s.Host }
-func (s *LocalSession) GetUser() string     { return s.User }
-func (s *LocalSession) IsLocal() bool       { return true }
+func (s *LocalSession) GetName() string         { return s.Name }
+func (s *LocalSession) GetType() string         { return "local" }
+func (s *LocalSession) GetHost() string         { return s.Host }
+func (s *LocalSession) GetUser() string         { return s.User }
+func (s *LocalSession) IsLocal() bool           { return true }
 func (s *LocalSession) GetCreatedAt() time.Time { return s.CreatedAt }
 
 func (s *LocalSession) GetStatus() Status {
@@ -183,7 +183,7 @@ func (s *LocalSession) Close() error {
 
 // Manager manages named sessions (both SSH and local).
 type Manager struct {
-	sessions   map[string]Session // keyed by Name
+	sessions    map[string]Session // keyed by Name
 	defaultName string             // default session name
 	mu          sync.RWMutex
 }
@@ -226,7 +226,20 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 				return nil, err
 			}
 
+			m.mu.RLock()
+			current, stillRegistered := m.sessions[name]
+			m.mu.RUnlock()
+			if !stillRegistered || current != sshSess {
+				client.Close()
+				return nil, fmt.Errorf("session was removed while reconnecting")
+			}
+
 			sshSess.mu.Lock()
+			if sshSess.Status != StatusConnecting {
+				sshSess.mu.Unlock()
+				client.Close()
+				return nil, fmt.Errorf("session state changed while reconnecting")
+			}
 			sshSess.Client = client
 			sshSess.Status = StatusConnected
 			sshSess.Password = password

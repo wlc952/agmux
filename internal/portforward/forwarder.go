@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -22,6 +23,7 @@ type Forwarder struct {
 	Type       string // "local" or "remote"
 	LocalPort  int
 	RemotePort int
+	BindAddr   string // remote bind address (for remote forwards)
 
 	sshClient   *ssh.Client
 	listener    net.Listener
@@ -35,12 +37,17 @@ type Forwarder struct {
 type remoteListenerFactory func(client *ssh.Client, addr string) (net.Listener, error)
 
 // NewForwarder creates a new port forwarder.
-func NewForwarder(sshClient *ssh.Client, forwardType string, localPort, remotePort int) (*Forwarder, error) {
+func NewForwarder(sshClient *ssh.Client, forwardType string, localPort, remotePort int, bindAddr string) (*Forwarder, error) {
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
+	}
+
 	f := &Forwarder{
 		ID:         uuid.New().String(),
 		Type:       forwardType,
 		LocalPort:  localPort,
 		RemotePort: remotePort,
+		BindAddr:   bindAddr,
 		sshClient:  sshClient,
 		conns:      make(map[net.Conn]bool),
 	}
@@ -55,7 +62,7 @@ func NewForwarder(sshClient *ssh.Client, forwardType string, localPort, remotePo
 		f.listener = listener
 		log.Printf("[portforward] Local forward: localhost:%d -> remote:%d", localPort, remotePort)
 	case "remote":
-		log.Printf("[portforward] Remote forward: remote:%d -> localhost:%d", remotePort, localPort)
+		log.Printf("[portforward] Remote forward: %s:%d -> localhost:%d", bindAddr, remotePort, localPort)
 	default:
 		return nil, fmt.Errorf("invalid forward type: %s", forwardType)
 	}
@@ -176,7 +183,7 @@ func (f *Forwarder) startRemoteForward(factory remoteListenerFactory) error {
 		return fmt.Errorf("SSH client is nil, cannot start remote forward")
 	}
 
-	remoteAddr := fmt.Sprintf("0.0.0.0:%d", f.RemotePort)
+	remoteAddr := net.JoinHostPort(f.BindAddr, strconv.Itoa(f.RemotePort))
 	listener, err := factory(client, remoteAddr)
 	if err != nil {
 		return fmt.Errorf("failed to listen on remote port %d: %w", f.RemotePort, err)
@@ -186,7 +193,7 @@ func (f *Forwarder) startRemoteForward(factory remoteListenerFactory) error {
 	f.listener = listener
 	f.mu.Unlock()
 
-	log.Printf("[portforward] Remote forward: listening on port %d", f.RemotePort)
+	log.Printf("[portforward] Remote forward: listening on %s:%d", f.BindAddr, f.RemotePort)
 
 	f.wg.Add(1)
 	go func() {
@@ -340,7 +347,7 @@ func NewService(sessions *session.Manager) *Service {
 }
 
 // Add creates a new port forward for the given session.
-func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int) (*ForwardInfo, error) {
+func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int, bindAddr string) (*ForwardInfo, error) {
 	sess, err := s.sessions.Get(sessionName)
 	if err != nil {
 		return nil, err
@@ -356,7 +363,7 @@ func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int
 		return nil, fmt.Errorf("session not connected")
 	}
 
-	forwarder, err := NewForwarder(sshClient, forwardType, localPort, remotePort)
+	forwarder, err := NewForwarder(sshClient, forwardType, localPort, remotePort, bindAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -380,6 +387,7 @@ func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int
 		Type:       forwarder.Type,
 		LocalPort:  forwarder.LocalPort,
 		RemotePort: forwarder.RemotePort,
+		BindAddr:   forwarder.BindAddr,
 	}, nil
 }
 
@@ -400,6 +408,7 @@ func (s *Service) List() []*ForwardInfo {
 			Type:       f.Type,
 			LocalPort:  f.LocalPort,
 			RemotePort: f.RemotePort,
+			BindAddr:   f.BindAddr,
 		})
 	}
 	return result
@@ -439,4 +448,5 @@ type ForwardInfo struct {
 	Type       string `json:"type"`
 	LocalPort  int    `json:"local_port"`
 	RemotePort int    `json:"remote_port"`
+	BindAddr   string `json:"bind_addr,omitempty"`
 }

@@ -5,6 +5,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -14,6 +16,8 @@ import (
 // Client wraps an SSH client connection.
 type Client struct {
 	GoClient *ssh.Client
+	mu       sync.Mutex
+	probing  bool
 }
 
 // AuthConfig holds authentication parameters.
@@ -67,28 +71,46 @@ func Connect(user, host string, port int, auth AuthConfig) (*Client, error) {
 
 // Close closes the SSH connection.
 func (c *Client) Close() error {
-	if c.GoClient != nil {
-		return c.GoClient.Close()
+	c.mu.Lock()
+	client := c.GoClient
+	c.GoClient = nil
+	c.probing = false
+	c.mu.Unlock()
+
+	if client != nil {
+		return client.Close()
 	}
 	return nil
 }
 
 // IsAlive checks if the SSH connection is still alive.
 func (c *Client) IsAlive() bool {
+	c.mu.Lock()
 	if c.GoClient == nil {
+		c.mu.Unlock()
 		return false
 	}
-	// SendRequest with wantReply=true can block on a dead connection.
-	// Run in goroutine with timeout.
+	if c.probing {
+		c.mu.Unlock()
+		return false
+	}
+	client := c.GoClient
+	c.probing = true
+	c.mu.Unlock()
+
 	aliveCh := make(chan bool, 1)
 	go func() {
-		_, _, err := c.GoClient.SendRequest("keepalive@agmux", true, nil)
+		_, _, err := client.SendRequest("keepalive@agmux", true, nil)
+		c.mu.Lock()
+		c.probing = false
+		c.mu.Unlock()
 		aliveCh <- (err == nil)
 	}()
 	select {
 	case alive := <-aliveCh:
 		return alive
 	case <-time.After(5 * time.Second):
+		_ = c.Close()
 		return false
 	}
 }
@@ -162,6 +184,17 @@ func getHostKeyCallback() (ssh.HostKeyCallback, error) {
 
 		// Unknown key (len(Want) == 0): Trust-On-First-Use — auto-accept
 		if len(keyErr.Want) == 0 {
+			autoTrust := strings.EqualFold(os.Getenv("AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS"), "1") ||
+				strings.EqualFold(os.Getenv("AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS"), "true")
+			if !autoTrust {
+				return fmt.Errorf(
+					"unknown host key for %s (%s), refusing auto-trust; add it to %s or set AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS=1",
+					hostname,
+					ssh.FingerprintSHA256(key),
+					knownHostsPath,
+				)
+			}
+
 			f, fErr := os.OpenFile(knownHostsPath, os.O_APPEND|os.O_WRONLY, 0600)
 			if fErr != nil {
 				return fmt.Errorf("failed to open known_hosts for appending: %w", fErr)

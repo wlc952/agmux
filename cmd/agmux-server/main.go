@@ -8,6 +8,7 @@ import (
 	"syscall"
 
 	"agmux/internal/server"
+	"agmux/internal/socketpath"
 )
 
 var version = "dev"
@@ -44,5 +45,5 @@ func main() {
 }
 
 func defaultSocketPath() string {
-	return "/tmp/agmux.sock"
+	return socketpath.Default()
 }

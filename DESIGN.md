@@ -523,7 +523,7 @@ agmux exec [-n name] [-t timeout] [--sudo ...] "command"
 agmux run [-t timeout] [--sudo ...] "command" # One-off local exec (no session)
 agmux list | ls                              # List sessions
 agmux use <name>                             # Set default session
-agmux forward [-n name] -l local -r remote [-R]
+agmux forward [-n name] -l local -r remote [-R] [--bind addr|--public]
 agmux forwards                               # List forwards
 agmux forward-close <id>
 agmux scp [-n name] -put|-get <src> <dst>
@@ -537,7 +537,7 @@ agmux -S <socket_path>                       # Override socket path
 ```
 
 Global flags:
-- `-S socket_path`: Override socket path (default: `/tmp/agmux-{UID}.sock`)
+- `-S socket_path`: Override socket path (default: `$XDG_RUNTIME_DIR/agmux/agmux.sock`, fallback `~/.agmux/run/agmux.sock`)
 - `-v, --version`: Show version
 
 ## 14. Implementation Order

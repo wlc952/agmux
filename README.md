@@ -143,6 +143,9 @@ agmux forward -n production -l 8080 -r 80
 # 远程端口转发：远程 9000 -> 本地 3000
 agmux forward -n production -R -l 3000 -r 9000
 
+# 显式暴露到远端所有网卡（默认不开放）
+agmux forward -n production -R -l 3000 -r 9000 --public
+
 # 列出所有转发
 agmux forwards
 
@@ -190,7 +193,7 @@ agmux -v
 
 | 选项 | 说明 |
 |------|------|
-| `-S socket_path` | Unix socket 路径（默认：`/tmp/agmux.sock`） |
+| `-S socket_path` | Unix socket 路径（默认：`$XDG_RUNTIME_DIR/agmux/agmux.sock`，否则 `~/.agmux/run/agmux.sock`） |
 | `-n name` | 会话名称 |
 | `-u user` | 用户名 |
 | `-h host` | 主机地址 |
@@ -205,6 +208,8 @@ agmux -v
 | `-l local` | 本地端口 |
 | `-r remote` | 远程端口 |
 | `-R` | 远程端口转发 |
+| `--bind` | 远程转发监听地址（仅 `-R`，默认：`127.0.0.1`） |
+| `--public` | 远程转发监听 `0.0.0.0`（仅 `-R`） |
 | `-put` | 上传模式 |
 | `-get` | 下载模式 |
 | `-c command` | SFTP 命令（ls/mkdir/rm） |
@@ -240,6 +245,7 @@ agmux/
 - **不支持交互式命令**：vim、less、top 等需要 TTY 的程序无法使用
 - **密码暴露**：密码通过命令行传递，在 `ps aux` 中可能可见（与 SSH 原生行为一致）
 - **daemon 重启后 SSH 会话需重新认证**：密码不持久化到磁盘，agent 需重新 `attach -P password`
+- **首次主机密钥默认不自动信任**：需预先写入 `known_hosts`；仅在显式设置 `AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS=1` 时启用自动接收
 
 ## 开发
 

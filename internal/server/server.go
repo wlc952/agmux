@@ -16,6 +16,7 @@ import (
 	"agmux/internal/protocol"
 	"agmux/internal/reconnect"
 	"agmux/internal/session"
+	"agmux/internal/socketpath"
 	"agmux/internal/transfer"
 
 	"agmux/pkg/imsg"
@@ -35,6 +36,10 @@ type Server struct {
 	wg         sync.WaitGroup
 	shutdown   chan struct{}
 	stopOnce   sync.Once
+	connMu     sync.Mutex
+	activeConn map[net.Conn]struct{}
+	acceptMu   sync.Mutex
+	stopping   bool
 }
 
 // NewServer creates a new server instance.
@@ -50,6 +55,7 @@ func NewServer(socketPath string) *Server {
 		persist:    persist.NewStore(),
 		audit:      audit.NewLogger(),
 		shutdown:   make(chan struct{}),
+		activeConn: make(map[net.Conn]struct{}),
 	}
 
 	// Reconnect monitor uses the actual forwards service.
@@ -60,8 +66,12 @@ func NewServer(socketPath string) *Server {
 
 // Start begins listening on the Unix socket.
 func (s *Server) Start() error {
-	// Remove old socket file
-	os.Remove(s.socketPath)
+	if err := socketpath.EnsureParentDir(s.socketPath); err != nil {
+		return fmt.Errorf("failed to create socket parent directory: %w", err)
+	}
+	if err := socketpath.RemoveIfOwnedSocket(s.socketPath); err != nil {
+		return err
+	}
 
 	listener, err := net.Listen("unix", s.socketPath)
 	if err != nil {
@@ -69,7 +79,10 @@ func (s *Server) Start() error {
 	}
 
 	// Set socket permissions to 0600 (owner only)
-	os.Chmod(s.socketPath, 0600)
+	if err := os.Chmod(s.socketPath, 0600); err != nil {
+		listener.Close()
+		return fmt.Errorf("failed to set socket permissions: %w", err)
+	}
 
 	s.listener = listener
 	log.Printf("[server] Listening on %s", s.socketPath)
@@ -88,8 +101,21 @@ func (s *Server) Start() error {
 				continue
 			}
 		}
-
+		select {
+		case <-s.shutdown:
+			conn.Close()
+			return nil
+		default:
+		}
+		s.acceptMu.Lock()
+		if s.stopping {
+			s.acceptMu.Unlock()
+			conn.Close()
+			return nil
+		}
+		s.addConn(conn)
 		s.wg.Add(1)
+		s.acceptMu.Unlock()
 		go s.handleConn(conn)
 	}
 }
@@ -100,6 +126,9 @@ func (s *Server) Stop() error {
 		log.Println("[server] Shutting down...")
 
 		close(s.shutdown)
+		s.acceptMu.Lock()
+		s.stopping = true
+		s.acceptMu.Unlock()
 
 		// 1. Close listener
 		if s.listener != nil {
@@ -115,11 +144,27 @@ func (s *Server) Stop() error {
 		// 3. Kill all sessions
 		s.sessions.KillAll()
 
-		// 4. Wait for goroutines
-		s.wg.Wait()
+		// 4. Drain active handlers. Connections can appear while shutdown is in progress,
+		// so keep closing tracked conns until all handlers exit.
+		waitDone := make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(waitDone)
+		}()
+	drainLoop:
+		for {
+			s.closeActiveConns()
+			select {
+			case <-waitDone:
+				break drainLoop
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
 
 		// 5. Cleanup
-		os.Remove(s.socketPath)
+		if err := socketpath.RemoveIfOwnedSocket(s.socketPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("[server] Failed to remove socket: %v", err)
+		}
 		s.audit.Close()
 
 		log.Println("[server] Shutdown complete")
@@ -130,7 +175,10 @@ func (s *Server) Stop() error {
 
 func (s *Server) handleConn(conn net.Conn) {
 	defer s.wg.Done()
-	defer conn.Close()
+	defer func() {
+		s.removeConn(conn)
+		conn.Close()
+	}()
 
 	for {
 		msg, err := imsg.ReadMessage(conn)
@@ -281,7 +329,7 @@ func (s *Server) dispatch(msg *imsg.Imsg) (*imsg.Imsg, error) {
 		if err := protocol.DecodePayload(msg.Payload, &params); err != nil {
 			return nil, fmt.Errorf("invalid params: %w", err)
 		}
-		info, err := s.forwards.Add(params.Name, params.Type, params.LocalPort, params.RemotePort)
+		info, err := s.forwards.Add(params.Name, params.Type, params.LocalPort, params.RemotePort, params.BindAddr)
 		if err != nil {
 			return nil, err
 		}
@@ -463,5 +511,30 @@ func (s *Server) restoreState() {
 			state.Name, state.User, state.Host, state.Port,
 			state.KeyPath, time.Unix(state.CreatedAt, 0),
 		)
+	}
+}
+
+func (s *Server) addConn(conn net.Conn) {
+	s.connMu.Lock()
+	s.activeConn[conn] = struct{}{}
+	s.connMu.Unlock()
+}
+
+func (s *Server) removeConn(conn net.Conn) {
+	s.connMu.Lock()
+	delete(s.activeConn, conn)
+	s.connMu.Unlock()
+}
+
+func (s *Server) closeActiveConns() {
+	s.connMu.Lock()
+	conns := make([]net.Conn, 0, len(s.activeConn))
+	for conn := range s.activeConn {
+		conns = append(conns, conn)
+	}
+	s.connMu.Unlock()
+
+	for _, conn := range conns {
+		conn.Close()
 	}
 }

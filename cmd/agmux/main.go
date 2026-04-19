@@ -9,8 +9,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"agmux/internal/protocol"
+	"agmux/internal/socketpath"
 	"agmux/pkg/imsg"
 )
 
@@ -18,6 +20,8 @@ var (
 	socketPath string
 	version    = "dev"
 )
+
+const rpcTimeout = 10 * time.Second
 
 func main() {
 	// Parse global -S flag first
@@ -102,11 +106,24 @@ func main() {
 }
 
 func sendRequest(method uint16, params interface{}) ([]byte, error) {
-	conn, err := net.Dial("unix", socketPath)
+	if err := socketpath.Validate(socketPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
+		}
+		return nil, err
+	}
+
+	conn, err := net.DialTimeout("unix", socketPath, rpcTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
 	}
 	defer conn.Close()
+	if err := verifyDaemonPeer(conn); err != nil {
+		return nil, err
+	}
+	if err := conn.SetDeadline(time.Now().Add(rpcTimeout)); err != nil {
+		return nil, fmt.Errorf("failed to set RPC deadline: %w", err)
+	}
 
 	var payload []byte
 	if params != nil {
@@ -141,11 +158,22 @@ func sendRequest(method uint16, params interface{}) ([]byte, error) {
 
 func handleStart() error {
 	// Check if daemon is already running
-	conn, err := net.Dial("unix", socketPath)
-	if err == nil {
-		conn.Close()
-		fmt.Println("Daemon is already running")
-		return nil
+	if _, err := os.Lstat(socketPath); err == nil {
+		if err := socketpath.Validate(socketPath); err != nil {
+			return err
+		}
+		conn, err := net.DialTimeout("unix", socketPath, 2*time.Second)
+		if err == nil {
+			if err := verifyDaemonPeer(conn); err != nil {
+				conn.Close()
+				return err
+			}
+			conn.Close()
+			fmt.Println("Daemon is already running")
+			return nil
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to inspect socket path: %w", err)
 	}
 
 	// Fork daemon process
@@ -464,6 +492,8 @@ func handleForward(args []string) error {
 	local := fs.Int("l", 0, "Local port")
 	remote := fs.Int("r", 0, "Remote port")
 	isRemote := fs.Bool("R", false, "Remote port forward")
+	bindAddr := fs.String("bind", "", "Remote bind address (for -R, default 127.0.0.1)")
+	publicBind := fs.Bool("public", false, "Remote bind on 0.0.0.0 (for -R)")
 
 	fs.Parse(args)
 
@@ -472,8 +502,21 @@ func handleForward(args []string) error {
 	}
 
 	forwardType := "local"
+	resolvedBindAddr := ""
 	if *isRemote {
 		forwardType = "remote"
+		if *publicBind && *bindAddr != "" {
+			return fmt.Errorf("--public and --bind cannot be used together")
+		}
+		if *publicBind {
+			resolvedBindAddr = "0.0.0.0"
+		} else if *bindAddr != "" {
+			resolvedBindAddr = *bindAddr
+		} else {
+			resolvedBindAddr = "127.0.0.1"
+		}
+	} else if *publicBind || *bindAddr != "" {
+		return fmt.Errorf("--bind/--public are only valid with -R")
 	}
 
 	params := protocol.ForwardParams{
@@ -481,6 +524,7 @@ func handleForward(args []string) error {
 		Type:       forwardType,
 		LocalPort:  *local,
 		RemotePort: *remote,
+		BindAddr:   resolvedBindAddr,
 	}
 
 	result, err := sendRequest(protocol.MsgForward, params)
@@ -493,7 +537,15 @@ func handleForward(args []string) error {
 		return fmt.Errorf("failed to parse result: %w", err)
 	}
 
-	fmt.Printf("Forward started: %s %d:%d (ID: %s)\n", info.Type, info.LocalPort, info.RemotePort, info.ID[:8])
+	if info.Type == "remote" {
+		bind := info.BindAddr
+		if bind == "" {
+			bind = "127.0.0.1"
+		}
+		fmt.Printf("Forward started: %s %d:%s:%d (ID: %s)\n", info.Type, info.LocalPort, bind, info.RemotePort, info.ID[:8])
+	} else {
+		fmt.Printf("Forward started: %s %d:%d (ID: %s)\n", info.Type, info.LocalPort, info.RemotePort, info.ID[:8])
+	}
 	return nil
 }
 
@@ -513,9 +565,16 @@ func handleForwards() error {
 		return nil
 	}
 
-	fmt.Println("ID        SESSION         TYPE     LOCAL  REMOTE")
+	fmt.Println("ID        SESSION         TYPE     BIND            LOCAL  REMOTE")
 	for _, f := range forwards {
-		fmt.Printf("%-9s %-15s %-8s %-6d %d\n", f.ID[:8], f.Session, f.Type, f.LocalPort, f.RemotePort)
+		bind := "-"
+		if f.Type == "remote" {
+			bind = f.BindAddr
+			if bind == "" {
+				bind = "127.0.0.1"
+			}
+		}
+		fmt.Printf("%-9s %-15s %-8s %-15s %-6d %d\n", f.ID[:8], f.Session, f.Type, bind, f.LocalPort, f.RemotePort)
 	}
 
 	return nil
@@ -686,7 +745,7 @@ func findServerBinary() (string, error) {
 }
 
 func defaultSocketPath() string {
-	return "/tmp/agmux.sock"
+	return socketpath.Default()
 }
 
 func printUsage() {
@@ -703,7 +762,7 @@ Usage:
   agmux run [-t timeout] [--sudo ...] "command"  One-off local exec
   agmux list | ls                                List sessions
   agmux use <name>                               Set default session
-  agmux forward [-n name] -l local -r remote [-R]
+  agmux forward [-n name] -l local -r remote [-R] [--bind addr|--public]
   agmux forwards                                 List forwards
   agmux forward-close <id>
   agmux scp [-n name] -put|-get <src> <dst>
@@ -715,13 +774,15 @@ Usage:
   agmux -v, --version
 
 Options:
-  -S socket_path    Unix socket path (default: /tmp/agmux.sock)
+  -S socket_path    Unix socket path (default: %s)
   -n name           Session name
   -t timeout        Command timeout in seconds
   --sudo            Run with sudo
   --sudo-password   Sudo password
   --sudo-user       Run as specified user
   --sudo-login      Login shell (-i)
+  --bind addr       Remote bind address for -R (default: 127.0.0.1)
+  --public          Shortcut for --bind 0.0.0.0
 
 Examples:
   agmux connect -u admin -h 10.0.1.1 -n production -P password
@@ -731,5 +792,5 @@ Examples:
   agmux detach -n production
   agmux attach -n production
   agmux forward -n production -l 8080 -r 80
-`, version)
+`, version, defaultSocketPath())
 }

@@ -29,6 +29,7 @@ type ForwardInfo struct {
 	Type       string `json:"type"` // "local" or "remote"
 	LocalPort  int    `json:"local_port"`
 	RemotePort int    `json:"remote_port"`
+	BindAddr   string `json:"bind_addr,omitempty"`
 }
 
 // TransferResult represents a file transfer result.
@@ -77,10 +78,10 @@ type AttachParams struct {
 }
 
 type ExecParams struct {
-	Name     string      `json:"name,omitempty"`
-	Command  string      `json:"command"`
-	Timeout  int         `json:"timeout,omitempty"`
-	Sudo     SudoOptions `json:"sudo,omitempty"`
+	Name    string      `json:"name,omitempty"`
+	Command string      `json:"command"`
+	Timeout int         `json:"timeout,omitempty"`
+	Sudo    SudoOptions `json:"sudo,omitempty"`
 }
 
 type LocalExecParams struct {
@@ -94,10 +95,11 @@ type UseParams struct {
 }
 
 type ForwardParams struct {
-	Name      string `json:"name,omitempty"`
-	Type      string `json:"type"` // "local" or "remote"
-	LocalPort int    `json:"local_port"`
-	RemotePort int   `json:"remote_port"`
+	Name       string `json:"name,omitempty"`
+	Type       string `json:"type"` // "local" or "remote"
+	LocalPort  int    `json:"local_port"`
+	RemotePort int    `json:"remote_port"`
+	BindAddr   string `json:"bind_addr,omitempty"`
 }
 
 type ForwardCloseParams struct {

@@ -1,16 +1,19 @@
 package transfer
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"agmux/internal/protocol"
 	"agmux/internal/session"
 
 	"github.com/pkg/sftp"
+	"golang.org/x/sys/unix"
 )
 
 // Service handles file transfer operations via SFTP.
@@ -238,8 +241,32 @@ func (s *sftpSession) Download(remotePath, localPath string) (int64, error) {
 	}
 
 	if !remoteInfo.IsDir() {
-		return s.downloadFile(remotePath, localPath)
+		targetPath, rootAbs, rootResolved, err := prepareSingleFileDownloadTarget(localPath)
+		if err != nil {
+			return 0, err
+		}
+		safeTarget, err := safeLocalDownloadPath(rootAbs, rootResolved, targetPath)
+		if err != nil {
+			return 0, err
+		}
+		rootFD, err := openRootDirNoFollow(rootAbs)
+		if err != nil {
+			return 0, err
+		}
+		defer unix.Close(rootFD)
+
+		return s.downloadFile(remotePath, rootFD, filepath.Base(safeTarget), remoteInfo.ModTime())
 	}
+
+	rootAbs, rootResolved, err := prepareDownloadRoot(localPath)
+	if err != nil {
+		return 0, err
+	}
+	rootFD, err := openRootDirNoFollow(rootAbs)
+	if err != nil {
+		return 0, err
+	}
+	defer unix.Close(rootFD)
 
 	var totalWritten int64
 	walker := s.client.Walk(remotePath)
@@ -259,47 +286,50 @@ func (s *sftpSession) Download(remotePath, localPath string) (int64, error) {
 		if err := checkPathTraversal(relPath); err != nil {
 			return totalWritten, err
 		}
+		if relPath == "." {
+			continue
+		}
 
-		targetPath := filepath.Join(localPath, relPath)
+		targetPath := filepath.Join(rootAbs, relPath)
+		safeTarget, err := safeLocalDownloadPath(rootAbs, rootResolved, targetPath)
+		if err != nil {
+			return totalWritten, err
+		}
 
 		if info.IsDir() {
-			if err := os.MkdirAll(targetPath, info.Mode()); err != nil {
-				return totalWritten, fmt.Errorf("failed to create local directory %s: %w", targetPath, err)
+			if err := ensureDirAt(rootFD, relPath, info.Mode()); err != nil {
+				return totalWritten, fmt.Errorf("failed to create local directory %s: %w", safeTarget, err)
+			}
+			if err := ensureSafeLocalDir(safeTarget, info.Mode()); err != nil {
+				return totalWritten, fmt.Errorf("failed to create local directory %s: %w", safeTarget, err)
 			}
 			continue
 		}
 
 		// Skip if same size+mtime
-		localFileInfo, err := os.Stat(targetPath)
+		localFileInfo, err := os.Stat(safeTarget)
 		if err == nil && localFileInfo.Size() == info.Size() && localFileInfo.ModTime().Unix() == info.ModTime().Unix() {
 			continue
 		}
 
-		written, err := s.downloadFile(path, targetPath)
+		written, err := s.downloadFile(path, rootFD, relPath, info.ModTime())
 		if err != nil {
 			return totalWritten, err
 		}
 		totalWritten += written
-		if err := os.Chtimes(targetPath, info.ModTime(), info.ModTime()); err != nil {
-			return totalWritten, fmt.Errorf("failed to preserve local timestamps for %s: %w", targetPath, err)
-		}
 	}
 
 	return totalWritten, nil
 }
 
-func (s *sftpSession) downloadFile(remotePath, localPath string) (int64, error) {
+func (s *sftpSession) downloadFile(remotePath string, rootFD int, relPath string, modTime time.Time) (int64, error) {
 	remoteFile, err := s.client.Open(remotePath)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open remote file: %w", err)
 	}
 	defer remoteFile.Close()
 
-	if err := ensureLocalParentDir(localPath); err != nil {
-		return 0, err
-	}
-
-	localFile, err := os.Create(localPath)
+	localFile, err := openLocalFileNoFollowAt(rootFD, relPath, 0600)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create local file: %w", err)
 	}
@@ -312,9 +342,12 @@ func (s *sftpSession) downloadFile(remotePath, localPath string) (int64, error) 
 
 	remoteInfo, err := s.client.Stat(remotePath)
 	if err == nil {
-		if chmodErr := os.Chmod(localPath, remoteInfo.Mode()); chmodErr != nil {
+		if chmodErr := localFile.Chmod(remoteInfo.Mode()); chmodErr != nil {
 			return 0, fmt.Errorf("failed to preserve local mode: %w", chmodErr)
 		}
+	}
+	if err := setFileTimes(localFile, modTime); err != nil {
+		return 0, fmt.Errorf("failed to preserve local timestamps: %w", err)
 	}
 
 	return written, nil
@@ -348,6 +381,120 @@ func checkPathTraversal(relPath string) error {
 	return nil
 }
 
+func prepareDownloadRoot(localPath string) (string, string, error) {
+	rootAbs, err := filepath.Abs(localPath)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+	if err := ensureSafeLocalDir(rootAbs, 0755); err != nil {
+		return "", "", err
+	}
+	rootResolved, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+	return rootAbs, rootResolved, nil
+}
+
+func prepareSingleFileDownloadTarget(localPath string) (string, string, string, error) {
+	targetAbs, err := filepath.Abs(localPath)
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+	rootAbs := filepath.Dir(targetAbs)
+	if err := ensureSafeLocalDir(rootAbs, 0755); err != nil {
+		return "", "", "", err
+	}
+	rootResolved, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+	return targetAbs, rootAbs, rootResolved, nil
+}
+
+func safeLocalDownloadPath(rootAbs, rootResolved, targetPath string) (string, error) {
+	targetAbs, err := filepath.Abs(targetPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve destination path: %w", err)
+	}
+
+	if pathEscapesRoot(rootAbs, targetAbs) {
+		return "", fmt.Errorf("path traversal detected: %s escapes destination", targetAbs)
+	}
+
+	resolvedParent, err := resolveExistingParent(filepath.Dir(targetAbs))
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve destination parent: %w", err)
+	}
+	if pathEscapesRoot(rootResolved, resolvedParent) {
+		return "", fmt.Errorf("symlink traversal detected: %s escapes destination", targetAbs)
+	}
+
+	if info, err := os.Lstat(targetAbs); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("symlink traversal detected: %s is a symlink", targetAbs)
+	} else if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("failed to inspect destination path: %w", err)
+	}
+
+	return targetAbs, nil
+}
+
+func resolveExistingParent(path string) (string, error) {
+	current := path
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return resolved, nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		next := filepath.Dir(current)
+		if next == current {
+			return "", err
+		}
+		current = next
+	}
+}
+
+func ensureSafeLocalDir(path string, mode os.FileMode) error {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("destination path is a symlink: %s", path)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("destination path is not a directory: %s", path)
+		}
+		return nil
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to inspect destination path %s: %w", path, err)
+	}
+	if err := os.MkdirAll(path, mode); err != nil {
+		return fmt.Errorf("failed to create destination directory %s: %w", path, err)
+	}
+	info, err = os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("failed to inspect destination path %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("destination path is a symlink: %s", path)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("destination path is not a directory: %s", path)
+	}
+	return nil
+}
+
+func pathEscapesRoot(root, target string) bool {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return true
+	}
+	return rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator))
+}
+
 func ensureLocalParentDir(localPath string) error {
 	parent := filepath.Dir(localPath)
 	if parent == "." {
@@ -357,4 +504,128 @@ func ensureLocalParentDir(localPath string) error {
 		return fmt.Errorf("failed to create local parent directory %s: %w", parent, err)
 	}
 	return nil
+}
+
+func openRootDirNoFollow(path string) (int, error) {
+	dirFD, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, fmt.Errorf("failed to open destination root safely: %w", err)
+	}
+	return dirFD, nil
+}
+
+func openLocalFileNoFollowAt(rootFD int, relPath string, perm os.FileMode) (*os.File, error) {
+	cleanRel := filepath.Clean(relPath)
+	if cleanRel == "." || cleanRel == "" || cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("invalid destination relative path: %s", relPath)
+	}
+
+	if err := ensureDirAt(rootFD, filepath.Dir(cleanRel), 0755); err != nil {
+		return nil, err
+	}
+
+	parentFD, err := openDirAt(rootFD, filepath.Dir(cleanRel))
+	if err != nil {
+		return nil, err
+	}
+	if parentFD != rootFD {
+		defer unix.Close(parentFD)
+	}
+
+	name := filepath.Base(cleanRel)
+	fileFD, err := unix.Openat(parentFD, name, unix.O_CREAT|unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, uint32(perm.Perm()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to open destination file safely: %w", err)
+	}
+
+	file := os.NewFile(uintptr(fileFD), cleanRel)
+	if file == nil {
+		unix.Close(fileFD)
+		return nil, fmt.Errorf("failed to wrap destination file descriptor")
+	}
+	return file, nil
+}
+
+func ensureDirAt(rootFD int, relPath string, mode os.FileMode) error {
+	cleanRel := filepath.Clean(relPath)
+	if cleanRel == "." || cleanRel == "" {
+		return nil
+	}
+	if cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("invalid destination relative path: %s", relPath)
+	}
+
+	parts := strings.Split(cleanRel, string(os.PathSeparator))
+	currentFD := rootFD
+	for idx, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			return fmt.Errorf("invalid destination relative path: %s", relPath)
+		}
+
+		createMode := uint32(0755)
+		if idx == len(parts)-1 {
+			createMode = uint32(mode.Perm())
+		}
+		if err := unix.Mkdirat(currentFD, part, createMode); err != nil && !errors.Is(err, unix.EEXIST) {
+			if currentFD != rootFD {
+				unix.Close(currentFD)
+			}
+			return fmt.Errorf("failed to create destination directory: %w", err)
+		}
+
+		nextFD, err := unix.Openat(currentFD, part, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+		if currentFD != rootFD {
+			unix.Close(currentFD)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to open destination directory safely: %w", err)
+		}
+		currentFD = nextFD
+	}
+	if currentFD != rootFD {
+		unix.Close(currentFD)
+	}
+	return nil
+}
+
+func openDirAt(rootFD int, relPath string) (int, error) {
+	cleanRel := filepath.Clean(relPath)
+	if cleanRel == "." || cleanRel == "" {
+		return rootFD, nil
+	}
+	if cleanRel == ".." || strings.HasPrefix(cleanRel, ".."+string(os.PathSeparator)) {
+		return -1, fmt.Errorf("invalid destination relative path: %s", relPath)
+	}
+
+	parts := strings.Split(cleanRel, string(os.PathSeparator))
+	currentFD := rootFD
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		if part == ".." {
+			if currentFD != rootFD {
+				unix.Close(currentFD)
+			}
+			return -1, fmt.Errorf("invalid destination relative path: %s", relPath)
+		}
+
+		nextFD, err := unix.Openat(currentFD, part, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_DIRECTORY|unix.O_NOFOLLOW, 0)
+		if currentFD != rootFD {
+			unix.Close(currentFD)
+		}
+		if err != nil {
+			return -1, fmt.Errorf("failed to open destination directory safely: %w", err)
+		}
+		currentFD = nextFD
+	}
+	return currentFD, nil
+}
+
+func setFileTimes(file *os.File, modTime time.Time) error {
+	tv := unix.NsecToTimeval(modTime.UnixNano())
+	return unix.Futimes(int(file.Fd()), []unix.Timeval{tv, tv})
 }
