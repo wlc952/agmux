@@ -23,6 +23,11 @@ var (
 
 const rpcTimeout = 10 * time.Second
 
+// socketDeadlineBuffer is the extra time added on top of the user-specified
+// command timeout to give the server room to finish and respond before the
+// client socket deadline fires.
+const socketDeadlineBuffer = 30 * time.Second
+
 func main() {
 	// Parse global -S flag first
 	args := os.Args[1:]
@@ -105,7 +110,24 @@ func main() {
 	}
 }
 
+// sendRequest sends an RPC request and waits for a response using the default
+// rpcTimeout for both connection and response.
 func sendRequest(method uint16, params interface{}) ([]byte, error) {
+	return sendRequestWithTimeout(method, params, rpcTimeout)
+}
+
+// sendRequestWithCmdTimeout is like sendRequest but extends the socket deadline
+// to accommodate a user-specified command timeout (e.g. from -t flag).
+// cmdTimeoutSecs == 0 means no command timeout → use rpcTimeout.
+func sendRequestWithCmdTimeout(method uint16, params interface{}, cmdTimeoutSecs int) ([]byte, error) {
+	deadline := rpcTimeout
+	if cmdTimeoutSecs > 0 {
+		deadline = time.Duration(cmdTimeoutSecs)*time.Second + socketDeadlineBuffer
+	}
+	return sendRequestWithTimeout(method, params, deadline)
+}
+
+func sendRequestWithTimeout(method uint16, params interface{}, deadline time.Duration) ([]byte, error) {
 	if err := socketpath.Validate(socketPath); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
@@ -121,7 +143,7 @@ func sendRequest(method uint16, params interface{}) ([]byte, error) {
 	if err := verifyDaemonPeer(conn); err != nil {
 		return nil, err
 	}
-	if err := conn.SetDeadline(time.Now().Add(rpcTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(deadline)); err != nil {
 		return nil, fmt.Errorf("failed to set RPC deadline: %w", err)
 	}
 
@@ -154,6 +176,87 @@ func sendRequest(method uint16, params interface{}) ([]byte, error) {
 	}
 
 	return resp.Payload, nil
+}
+
+// sendStreamRequest sends a streaming exec request and prints output chunks to
+// stdout/stderr as they arrive, blocking until the server sends MsgStreamEnd.
+// When cmdTimeoutSecs > 0 the socket deadline is set to timeout + buffer;
+// when cmdTimeoutSecs == 0 (unlimited) no deadline is imposed.
+func sendStreamRequest(method uint16, params interface{}, cmdTimeoutSecs int) error {
+	if err := socketpath.Validate(socketPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
+		}
+		return err
+	}
+
+	conn, err := net.DialTimeout("unix", socketPath, rpcTimeout)
+	if err != nil {
+		return fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
+	}
+	defer conn.Close()
+	if err := verifyDaemonPeer(conn); err != nil {
+		return err
+	}
+	if cmdTimeoutSecs > 0 {
+		deadline := time.Duration(cmdTimeoutSecs)*time.Second + socketDeadlineBuffer
+		if err := conn.SetDeadline(time.Now().Add(deadline)); err != nil {
+			return fmt.Errorf("failed to set deadline: %w", err)
+		}
+	}
+	// When cmdTimeoutSecs == 0, no deadline: the connection waits as long as needed.
+
+	payload, err := protocol.EncodePayload(params)
+	if err != nil {
+		return fmt.Errorf("failed to encode params: %w", err)
+	}
+
+	if err := imsg.WriteMessage(conn, imsg.NewImsg(method, payload)); err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+
+	for {
+		msg, err := imsg.ReadMessage(conn)
+		if err != nil {
+			return fmt.Errorf("failed to read stream: %w", err)
+		}
+
+		switch msg.Type {
+		case protocol.MsgStreamChunk:
+			var chunk protocol.StreamChunk
+			if err := json.Unmarshal(msg.Payload, &chunk); err != nil {
+				return fmt.Errorf("failed to decode chunk: %w", err)
+			}
+			if chunk.Stream == "stderr" {
+				os.Stderr.Write(chunk.Data)
+			} else {
+				os.Stdout.Write(chunk.Data)
+			}
+
+		case protocol.MsgStreamEnd:
+			var end protocol.StreamEnd
+			if err := json.Unmarshal(msg.Payload, &end); err != nil {
+				return fmt.Errorf("failed to decode stream end: %w", err)
+			}
+			if end.Error != "" {
+				return fmt.Errorf("%s", end.Error)
+			}
+			if end.ExitCode != 0 {
+				os.Exit(end.ExitCode)
+			}
+			return nil
+
+		case protocol.MsgError:
+			var errPayload protocol.ErrorPayload
+			if err := json.Unmarshal(msg.Payload, &errPayload); err != nil {
+				return fmt.Errorf("RPC error (unparseable)")
+			}
+			return fmt.Errorf("RPC error: %s", errPayload.Message)
+
+		default:
+			return fmt.Errorf("unexpected message type during stream: %d", msg.Type)
+		}
+	}
 }
 
 func handleStart() error {
@@ -325,6 +428,7 @@ func handleExec(args []string) error {
 	sudoPassword := fs.String("sudo-password", "", "Sudo password")
 	sudoUser := fs.String("sudo-user", "", "Run as specified user")
 	sudoLogin := fs.Bool("sudo-login", false, "Login shell (-i)")
+	stream := fs.Bool("stream", false, "Stream output in real-time")
 
 	fs.Parse(args)
 
@@ -347,7 +451,11 @@ func handleExec(args []string) error {
 		Sudo:    sudoOpts,
 	}
 
-	result, err := sendRequest(protocol.MsgExec, params)
+	if *stream {
+		return sendStreamRequest(protocol.MsgExecStream, params, *timeout)
+	}
+
+	result, err := sendRequestWithCmdTimeout(protocol.MsgExec, params, *timeout)
 	if err != nil {
 		return err
 	}
@@ -378,6 +486,7 @@ func handleRun(args []string) error {
 	sudoPassword := fs.String("sudo-password", "", "Sudo password")
 	sudoUser := fs.String("sudo-user", "", "Run as specified user")
 	sudoLogin := fs.Bool("sudo-login", false, "Login shell (-i)")
+	stream := fs.Bool("stream", false, "Stream output in real-time")
 
 	fs.Parse(args)
 
@@ -399,7 +508,11 @@ func handleRun(args []string) error {
 		Sudo:    sudoOpts,
 	}
 
-	result, err := sendRequest(protocol.MsgLocalExec, params)
+	if *stream {
+		return sendStreamRequest(protocol.MsgLocalExecStream, params, *timeout)
+	}
+
+	result, err := sendRequestWithCmdTimeout(protocol.MsgLocalExec, params, *timeout)
 	if err != nil {
 		return err
 	}
@@ -758,8 +871,8 @@ Usage:
   agmux attach [-n name] [-P password] [-i key]  Attach to session
   agmux detach [-n name]                         Detach (SSH stays alive)
   agmux kill [-n name]                           Kill session
-  agmux exec [-n name] [-t timeout] [--sudo ...] "command"
-  agmux run [-t timeout] [--sudo ...] "command"  One-off local exec
+  agmux exec [-n name] [-t timeout] [--stream] [--sudo ...] "command"
+  agmux run [-t timeout] [--stream] [--sudo ...] "command"  One-off local exec
   agmux list | ls                                List sessions
   agmux use <name>                               Set default session
   agmux forward [-n name] -l local -r remote [-R] [--bind addr|--public]
@@ -781,6 +894,7 @@ Options:
   --sudo-password   Sudo password
   --sudo-user       Run as specified user
   --sudo-login      Login shell (-i)
+  --stream          Stream stdout/stderr in real-time (for long-running commands)
   --bind addr       Remote bind address for -R (default: 127.0.0.1)
   --public          Shortcut for --bind 0.0.0.0
 

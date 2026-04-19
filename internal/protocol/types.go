@@ -123,6 +123,18 @@ type ReconnectParams struct {
 	Name string `json:"name,omitempty"`
 }
 
+// StreamChunk carries an incremental chunk of command output during streaming exec.
+type StreamChunk struct {
+	Stream string `json:"stream"` // "stdout" or "stderr"
+	Data   []byte `json:"data"`   // raw output bytes (JSON-encoded as base64)
+}
+
+// StreamEnd signals the end of a streaming exec, carrying the final exit code.
+type StreamEnd struct {
+	ExitCode int    `json:"exit_code"`
+	Error    string `json:"error,omitempty"` // set when a fatal (non-exit) error occurred
+}
+
 // --- Helper functions ---
 
 // EncodePayload marshals a value to JSON bytes for imsg payload.
