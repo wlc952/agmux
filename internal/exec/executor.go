@@ -67,7 +67,7 @@ func runRemote(client *ssh.Client, command string, timeout int, sudoOpts *protoc
 	}
 	defer sshSession.Close()
 
-	fullCmd := fmt.Sprintf("/bin/sh -c %q", command)
+	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
 
 	if sudoOpts != nil && sudoOpts.Enabled {
 		return runRemoteSudo(sshSession, fullCmd, sudoOpts, timeout)
@@ -173,7 +173,7 @@ func runRemoteSudo(sshSession *ssh.Session, fullCmd string, sudoOpts *protocol.S
 // --- Local execution ---
 
 func runLocal(command string, timeout int, sudoOpts *protocol.SudoOptions) (*protocol.ExecResult, error) {
-	fullCmd := fmt.Sprintf("/bin/sh -c %q", command)
+	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
 
 	if sudoOpts != nil && sudoOpts.Enabled {
 		return runLocalSudo(fullCmd, sudoOpts, timeout)

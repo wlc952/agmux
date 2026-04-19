@@ -23,6 +23,11 @@ var (
 
 const rpcTimeout = 10 * time.Second
 
+// socketDeadlineBuffer is the extra time added on top of the user-specified
+// command timeout to give the server room to finish and respond before the
+// client socket deadline fires.
+const socketDeadlineBuffer = 30 * time.Second
+
 func main() {
 	// Parse global -S flag first
 	args := os.Args[1:]
@@ -105,7 +110,24 @@ func main() {
 	}
 }
 
+// sendRequest sends an RPC request and waits for a response using the default
+// rpcTimeout for both connection and response.
 func sendRequest(method uint16, params interface{}) ([]byte, error) {
+	return sendRequestWithTimeout(method, params, rpcTimeout)
+}
+
+// sendRequestWithCmdTimeout is like sendRequest but extends the socket deadline
+// to accommodate a user-specified command timeout (e.g. from -t flag).
+// cmdTimeoutSecs == 0 means no command timeout → use rpcTimeout.
+func sendRequestWithCmdTimeout(method uint16, params interface{}, cmdTimeoutSecs int) ([]byte, error) {
+	deadline := rpcTimeout
+	if cmdTimeoutSecs > 0 {
+		deadline = time.Duration(cmdTimeoutSecs)*time.Second + socketDeadlineBuffer
+	}
+	return sendRequestWithTimeout(method, params, deadline)
+}
+
+func sendRequestWithTimeout(method uint16, params interface{}, deadline time.Duration) ([]byte, error) {
 	if err := socketpath.Validate(socketPath); err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
@@ -121,7 +143,7 @@ func sendRequest(method uint16, params interface{}) ([]byte, error) {
 	if err := verifyDaemonPeer(conn); err != nil {
 		return nil, err
 	}
-	if err := conn.SetDeadline(time.Now().Add(rpcTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(deadline)); err != nil {
 		return nil, fmt.Errorf("failed to set RPC deadline: %w", err)
 	}
 
@@ -347,7 +369,7 @@ func handleExec(args []string) error {
 		Sudo:    sudoOpts,
 	}
 
-	result, err := sendRequest(protocol.MsgExec, params)
+	result, err := sendRequestWithCmdTimeout(protocol.MsgExec, params, *timeout)
 	if err != nil {
 		return err
 	}
@@ -399,7 +421,7 @@ func handleRun(args []string) error {
 		Sudo:    sudoOpts,
 	}
 
-	result, err := sendRequest(protocol.MsgLocalExec, params)
+	result, err := sendRequestWithCmdTimeout(protocol.MsgLocalExec, params, *timeout)
 	if err != nil {
 		return err
 	}
