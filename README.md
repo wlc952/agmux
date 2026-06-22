@@ -66,7 +66,7 @@ Agent（AI agent、自动化脚本）通过 agmux 执行远程命令比直接调
 ### 从源码构建
 
 ```bash
-git clone https://github.com/forechoandlook/agmux.git
+git clone https://github.com/wlc952/agmux.git
 cd agmux
 make build
 make install
