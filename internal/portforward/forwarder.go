@@ -6,12 +6,13 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
-	"agmux/internal/session"
+	"gssh/internal/session"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -414,13 +415,33 @@ func (s *Service) List() []*ForwardInfo {
 	return result
 }
 
-// Close shuts down a specific port forward.
+// Close shuts down a specific port forward. The ID may be a full UUID or an
+// unambiguous prefix (the CLI displays 8-char prefixes).
 func (s *Service) Close(forwardID string) error {
+	if forwardID == "" {
+		return fmt.Errorf("forward ID required")
+	}
+
 	s.mu.Lock()
 	forwarder, ok := s.forwards[forwardID]
 	if !ok {
-		s.mu.Unlock()
-		return fmt.Errorf("forward not found")
+		var matches []string
+		for id := range s.forwards {
+			if strings.HasPrefix(id, forwardID) {
+				matches = append(matches, id)
+			}
+		}
+		switch len(matches) {
+		case 0:
+			s.mu.Unlock()
+			return fmt.Errorf("forward not found")
+		case 1:
+			forwardID = matches[0]
+			forwarder = s.forwards[forwardID]
+		default:
+			s.mu.Unlock()
+			return fmt.Errorf("forward ID %q is ambiguous (%d matches)", forwardID, len(matches))
+		}
 	}
 	delete(s.forwards, forwardID)
 	s.mu.Unlock()

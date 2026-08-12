@@ -1,7 +1,7 @@
 # Binaries
 /bin/
-/agmux
-/agmux-server
+/gssh
+/gssh-server
 
 # Test
 *.test

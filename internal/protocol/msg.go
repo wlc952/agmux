@@ -2,21 +2,21 @@ package protocol
 
 // Message types: Client → Server (requests)
 const (
-	MsgConnect         uint16 = 1  // Connect to SSH host
-	MsgLocal           uint16 = 2  // Create local session
+	MsgConnect uint16 = 1 // Connect to SSH host
+	MsgLocal   uint16 = 2 // Create local session
 	// MsgDetach (3) and MsgAttach (5) removed — vacant, do not reuse
-	MsgKill            uint16 = 4  // Kill session
-	MsgExec            uint16 = 6  // Execute command in session
-	MsgLocalExec       uint16 = 7  // One-off local exec (no session)
-	MsgList            uint16 = 8  // List sessions
-	MsgUse             uint16 = 9  // Set default session
-	MsgForward         uint16 = 10 // Start port forward
-	MsgForwards        uint16 = 11 // List forwards
-	MsgForwardClose    uint16 = 12 // Close forward
-	MsgSCP             uint16 = 13 // File transfer
-	MsgSFTPLs          uint16 = 14 // SFTP list directory
-	MsgSFTPMkdir       uint16 = 15 // SFTP mkdir
-	MsgSFTPRm          uint16 = 16 // SFTP remove
+	MsgKill         uint16 = 4  // Kill session
+	MsgExec         uint16 = 6  // Execute command in session
+	MsgLocalExec    uint16 = 7  // One-off local exec (no session)
+	MsgList         uint16 = 8  // List sessions
+	MsgUse          uint16 = 9  // Set default session
+	MsgForward      uint16 = 10 // Start port forward
+	MsgForwards     uint16 = 11 // List forwards
+	MsgForwardClose uint16 = 12 // Close forward
+	MsgSCP          uint16 = 13 // File transfer
+	MsgSFTPLs       uint16 = 14 // SFTP list directory
+	MsgSFTPMkdir    uint16 = 15 // SFTP mkdir
+	MsgSFTPRm       uint16 = 16 // SFTP remove
 	// MsgReconnect (17) removed — use MsgUse with -p/-i instead
 	MsgPing            uint16 = 18 // Health check
 	MsgStop            uint16 = 19 // Stop daemon

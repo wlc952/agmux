@@ -5,13 +5,13 @@ import (
 	"testing"
 	"time"
 
-	"agmux/internal/session"
-	agssh "agmux/internal/ssh"
+	"gssh/internal/session"
+	sshclient "gssh/internal/ssh"
 )
 
 func TestCheckAndReconnectFailureReturnsBackoff(t *testing.T) {
 	mon := NewMonitor(session.NewManager(), nil)
-	mon.connect = func(user, host string, port int, auth agssh.AuthConfig) (*agssh.Client, error) {
+	mon.connect = func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error) {
 		return nil, fmt.Errorf("dial failed")
 	}
 

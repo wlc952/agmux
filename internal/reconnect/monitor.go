@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
-	"agmux/internal/portforward"
-	"agmux/internal/session"
-	agssh "agmux/internal/ssh"
+	"gssh/internal/portforward"
+	"gssh/internal/session"
+	sshclient "gssh/internal/ssh"
 )
 
 // Monitor watches SSH sessions for disconnection and reconnects with exponential backoff.
@@ -16,7 +16,7 @@ type Monitor struct {
 	forwards *portforward.Service
 	watched  map[string]watchCtx
 	mu       sync.Mutex
-	connect  func(user, host string, port int, auth agssh.AuthConfig) (*agssh.Client, error)
+	connect  func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error)
 }
 
 type watchCtx struct {
@@ -37,7 +37,7 @@ func NewMonitor(sessions *session.Manager, forwards *portforward.Service) *Monit
 		sessions: sessions,
 		forwards: forwards,
 		watched:  make(map[string]watchCtx),
-		connect:  agssh.Connect,
+		connect:  sshclient.Connect,
 	}
 }
 
@@ -108,7 +108,7 @@ func (m *Monitor) checkAndReconnect(sess *session.SSHSession, ctx *watchCtx) tim
 		sess.SetClient(nil)
 	}
 
-	newClient, err := m.connect(sess.User, sess.Host, sess.Port, agssh.AuthConfig{
+	newClient, err := m.connect(sess.User, sess.Host, sess.Port, sshclient.AuthConfig{
 		Password: sess.GetPassword(),
 		KeyPath:  sess.GetKeyPath(),
 	})

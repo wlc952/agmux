@@ -1,87 +1,111 @@
-# agmux - Architecture Design
+# gssh - Architecture Design
 
-agmux (Agent Multiplexer) is a session management and command execution tool for AI agents.
-Inspired by tmux's client-server architecture, it manages both SSH and local sessions,
-providing session switching with reconnect, structured output, and automatic reconnect.
+gssh is a session management and command execution tool for AI agents.
+Inspired by tmux's client-server architecture, it manages both SSH and local
+sessions, providing session switching with reconnect, structured output, and
+automatic reconnect.
+
+Core constraint: **fully non-interactive and scriptable — no TTY anywhere.**
 
 ## 1. Architecture Overview
 
+Single binary, tmux-style. The same `gssh` binary acts as thin client or as
+the daemon (`gssh server`). The daemon is started on demand: any command that
+needs it spawns it automatically when the socket is missing or stale.
+
 ```
 ┌──────────────┐  Unix Socket (0600)  ┌──────────────────┐
-│  agmux CLI   │ ──────────────────── │  agmux-server    │
-│  (thin client│  imsg binary protocol│  (daemon, persist)│
-└──────────────┘                       │                  │
-                                       │  Session Manager │
-                                       │  ┌──────────────┤
-                                       │  │ SSH Session  │────── SSH tunnel
-                                       │  │ Local Session│────── local exec
-                                       │  └──────────────┤
-                                       │  Services:      │
-                                       │  ExecService    │
-                                       │  ForwardService │
-                                       │  TransferService│
-                                       │  ReconnectMon   │
-                                       │  AuditLogger    │
-                                       └──────────────────┘
+│  gssh <cmd>  │ ──────────────────── │  gssh server     │
+│  thin client │  imsg binary protocol│  (daemon)        │
+└──────────────┘                      │                  │
+      │  auto-spawn if not running    │  Session Manager │
+      └─────────────────────────────▶ │  ┌──────────────┤
+                                      │  │ SSH Session  │────── SSH tunnel
+                                      │  │ Local Session│────── local exec
+                                      │  └──────────────┤
+                                      │  Services:      │
+                                      │  ExecService    │
+                                      │  ForwardService │
+                                      │  TransferService│
+                                      │  ReconnectMon   │
+                                      │  AuditLogger    │
+                                      └──────────────────┘
 ```
+
+Daemon lifecycle:
+
+- **Auto-start**: the CLI's dial path (`dialDaemon`) detects a missing
+  (`ENOENT`) or stale (`ECONNREFUSED`) socket, spawns `gssh server -S <sock>`
+  detached (setsid, stdin from /dev/null, stdout/stderr appended to
+  `~/.gssh/server.log`), and polls until the socket accepts connections
+  (5s timeout). Lifecycle commands (`start`, `stop`, `ping`, `server`) never
+  auto-start.
+- **Explicit start**: `gssh start` runs the same spawn path and waits for
+  readiness, so `gssh start && gssh connect ...` cannot race.
+- **Stop**: `gssh stop` sends MsgStop; the server runs the graceful shutdown
+  sequence and the daemon process exits (Start returning ends `runDaemon` —
+  including when shutdown was triggered by RPC rather than a signal).
 
 ## 2. Directory Structure
 
 ```
-agmux/
+gssh/
 ├── cmd/
-│   ├── agmux/main.go              # CLI client
-│   └── agmux-server/main.go       # Server daemon
+│   └── gssh/
+│       ├── main.go               # Entry point, command dispatch, usage
+│       ├── client.go             # RPC client: dial, auto-start, streaming
+│       ├── server.go             # `gssh server` subcommand (daemon)
+│       ├── commands.go           # Subcommand flag parsing + handlers
+│       ├── spawn_unix.go         # setsid detach (//go:build unix)
+│       ├── spawn_other.go        # no-op detach (//go:build !unix)
+│       ├── peercred_darwin.go    # Peer credential check (LOCAL_PEERCRED)
+│       ├── peercred_linux.go     # Peer credential check (SO_PEERCRED)
+│       └── peercred_other.go     # No-op on other platforms
 ├── internal/
 │   ├── protocol/
-│   │   ├── msg.go                  # Message type constants
-│   │   ├── types.go                # Request/Response struct definitions
-│   │   ├── encode.go               # JSON payload encoding for imsg
-│   │   └── encode_test.go
+│   │   ├── msg.go                # Message type constants
+│   │   └── types.go              # Request/response structs + JSON helpers
 │   ├── server/
-│   │   ├── server.go               # Server core: Unix socket listener, dispatch
-│   │   ├── conn.go                 # Client connection handling
-│   │   ├── server_test.go
+│   │   ├── server.go             # Unix socket listener, dispatch, streaming
+│   │   └── server_test.go
 │   ├── session/
-│   │   ├── session.go              # NamedSession struct, lifecycle states
-│   │   ├── ssh_session.go          # SSH session type
-│   │   ├── local_session.go        # Local session type
-│   │   ├── manager.go              # Session registry, named lookup, default
-│   │   ├── manager_test.go
+│   │   ├── session.go            # Session iface, SSHSession, LocalSession, Manager
+│   │   └── session_test.go
 │   ├── ssh/
-│   │   ├── client.go               # SSH client wrapper, auth, TOFU, Connect
-│   │   ├── client_test.go
+│   │   ├── client.go             # Dial, auth, known_hosts policy, IsAlive
+│   │   └── client_test.go
 │   ├── exec/
-│   │   ├── executor.go             # Command execution for both SSH and local
-│   │   ├── local.go                # Local command execution
-│   │   ├── remote.go               # Remote (SSH) command execution
-│   │   ├── sudo.go                 # Sudo via stdin helper
-│   │   ├── executor_test.go
+│   │   ├── executor.go           # remote/local × buffered/stream × sudo matrix
+│   │   └── executor_test.go
+│   ├── shellquote/
+│   │   ├── quote.go              # POSIX single-quote escaping
+│   │   └── quote_test.go
 │   ├── portforward/
-│   │   ├── forwarder.go            # Local/remote port forwarder
-│   │   ├── service.go              # Forward service (registry, lifecycle)
-│   │   ├── forwarder_test.go
+│   │   ├── forwarder.go          # Forwarder + Service (registry, lifecycle)
+│   │   └── forwarder_test.go
 │   ├── transfer/
-│   │   ├── sftp.go                 # SFTP upload/download/sync/directory ops
-│   │   ├── sftp_test.go
+│   │   ├── sftp.go               # SFTP upload/download/dir ops
+│   │   └── sftp_test.go
 │   ├── reconnect/
-│   │   ├── monitor.go              # Health check + exponential backoff reconnect
-│   │   ├── monitor_test.go
+│   │   ├── monitor.go            # Health check + exponential backoff
+│   │   └── monitor_test.go
 │   ├── persist/
-│   │   ├── store.go                # State persistence: save/load session metadata
-│   │   ├── store_test.go
+│   │   ├── store.go              # ~/.gssh/state.json save/load
+│   │   └── store_test.go
 │   ├── audit/
-│   │   ├── log.go                  # Audit logging
-│   │   ├── log_test.go
+│   │   ├── log.go                # ~/.gssh/audit.log JSON-lines
+│   │   └── log_test.go
+│   └── socketpath/
+│       ├── path.go               # Socket path resolution + validation
+│       ├── owner_unix.go         # UID ownership (unix)
+│       └── owner_windows.go
 ├── pkg/
-│   ├── imsg/
-│   │   ├── imsg.go                 # Imsg protocol: read/write binary frames
-│   │   ├── imsg_test.go
-├── go.mod
-├── go.sum
+│   └── imsg/
+│       ├── imsg.go               # Binary frame read/write
+│       └── imsg_test.go
 ├── Makefile
 ├── DESIGN.md
-├── .gitignore
+└── README.md
 ```
 
 ## 3. Protocol Design (imsg)
@@ -99,8 +123,8 @@ Binary frame with JSON payload. Human-debuggable, type-safe framing.
 ```
 
 - **Version** (uint8): Protocol version, currently 1
-- **Type** (uint16): Message type constant
-- **Length** (uint32): Payload length in bytes
+- **Type** (uint16): Message type constant, big-endian
+- **Length** (uint32): Payload length in bytes, big-endian, max 4 MiB
 - **Payload**: JSON-encoded request params or response result
 
 ### Message Types
@@ -108,33 +132,48 @@ Binary frame with JSON payload. Human-debuggable, type-safe framing.
 ```go
 // Client → Server (requests)
 const (
-    MsgConnect       uint16 = 1   // Connect to SSH host
-    MsgLocal         uint16 = 2   // Create local session
-    MsgDetach        uint16 = 3   // Detach from session
-    MsgKill          uint16 = 4   // Kill session
-    MsgAttach        uint16 = 5   // Attach to existing session
-    MsgExec          uint16 = 6   // Execute command (SSH or local)
-    MsgLocalExec     uint16 = 7   // Execute command locally (no session needed)
-    MsgList          uint16 = 8   // List sessions
-    MsgUse           uint16 = 9   // Set default session
-    MsgForward       uint16 = 10  // Start port forward
-    MsgForwards      uint16 = 11  // List forwards
-    MsgForwardClose  uint16 = 12  // Close forward
-    MsgSCP           uint16 = 13  // File transfer
-    MsgSFTPLs        uint16 = 14  // SFTP list directory
-    MsgSFTPMkdir     uint16 = 15  // SFTP mkdir
-    MsgSFTPRm        uint16 = 16  // SFTP remove
-    MsgReconnect     uint16 = 17  // Removed — use MsgUse with -p/-i instead
-    MsgPing          uint16 = 18  // Health check
+    MsgConnect         uint16 = 1
+    MsgLocal           uint16 = 2
+    // 3 (MsgDetach) and 5 (MsgAttach) removed — vacant, do not reuse
+    MsgKill            uint16 = 4
+    MsgExec            uint16 = 6
+    MsgLocalExec       uint16 = 7
+    MsgList            uint16 = 8
+    MsgUse             uint16 = 9
+    MsgForward         uint16 = 10
+    MsgForwards        uint16 = 11
+    MsgForwardClose    uint16 = 12
+    MsgSCP             uint16 = 13
+    MsgSFTPLs          uint16 = 14
+    MsgSFTPMkdir       uint16 = 15
+    MsgSFTPRm          uint16 = 16
+    // 17 (MsgReconnect) removed — use MsgUse with credentials instead
+    MsgPing            uint16 = 18
+    MsgStop            uint16 = 19
+    MsgExecStream      uint16 = 20
+    MsgLocalExecStream uint16 = 21
 )
 
 // Server → Client (responses)
 const (
-    MsgResult  uint16 = 100  // Success result
-    MsgError   uint16 = 101  // Error response
-    MsgPong    uint16 = 102  // Ping response
+    MsgResult      uint16 = 100
+    MsgError       uint16 = 101
+    MsgPong        uint16 = 102
+    MsgStreamChunk uint16 = 103
+    MsgStreamEnd   uint16 = 104
 )
 ```
+
+### Request/response flow
+
+Normal messages follow strict request → single-response. Streaming exec
+messages (MsgExecStream, MsgLocalExecStream) bypass the dispatch loop: the
+handler writes any number of MsgStreamChunk frames followed by exactly one
+MsgStreamEnd carrying the exit code.
+
+Responses larger than the 4 MiB frame cap are rejected with a clear MsgError
+telling the caller to re-run with `--stream`, instead of truncating the
+connection mid-write.
 
 ### Imsg API
 
@@ -149,9 +188,6 @@ type Imsg struct {
 func ReadMessage(r io.Reader) (*Imsg, error)
 func WriteMessage(w io.Writer, msg *Imsg) error
 ```
-
-ReadMessage reads the 7-byte header first, then reads exactly Length bytes of payload.
-No newline-delimited ambiguity — explicit length field solves partial reads.
 
 ## 4. Server Architecture
 
@@ -168,396 +204,200 @@ type Server struct {
     reconnect  *reconnect.Monitor
     persist    *persist.Store
     audit      *audit.Logger
-    wg         sync.WaitGroup
-    shutdown   chan struct{}
+    ...
 }
 
-func NewServer(opts ServerOptions) *Server
-func (s *Server) Start() error              // Listen on Unix socket, 0600 permissions
-func (s *Server) Stop() error               // Graceful shutdown: persist → kill all → wait
-func (s *Server) handleConn(conn net.Conn)  // Per-client goroutine: read imsg → dispatch → write
-func (s *Server) dispatch(msg *Imsg) (*Imsg, error) // Route by Type to service
+func (s *Server) Start() error   // EnsureParentDir → remove stale socket → listen → chmod 0600 → restoreState → accept loop
+func (s *Server) Stop() error    // Idempotent graceful shutdown
 ```
 
 ### Graceful Shutdown Sequence
 
 1. Close listener (reject new connections)
-2. Persist session state to disk
-3. Kill all SSH sessions (close connections)
-4. Wait for goroutines to finish
-5. Clean up socket file
+2. Persist session state to `~/.gssh/state.json`
+3. Kill all sessions (close SSH connections)
+4. Drain active connection handlers (poll-close until waitgroup empties)
+5. Remove socket file, close audit log
 
-### Signal Handling (cmd/agmux-server/main.go)
+### State Restore (on Start)
 
-```go
-sigCh := make(chan os.Signal, 1)
-signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-<-sigCh
-server.Stop()
-```
+- Load `~/.gssh/state.json`.
+- Local sessions: re-created immediately.
+- SSH sessions: registered as `offline`. If a key path was persisted, a
+  background goroutine reconnects via `Manager.Reconnect` and starts the
+  reconnect monitor. Password sessions stay offline (passwords are never
+  persisted) until the agent runs `gssh use <name> -p password`.
+- `Reconnect` deliberately does not steal the default session.
 
 ## 5. Session Model
 
-### Session Interface
-
-Both SSH and local sessions share a common interface:
+All session code lives in `internal/session/session.go`.
 
 ```go
 type Session interface {
     GetName() string
-    GetHost() string    // "local" for local sessions
-    GetUser() string    // OS username for local sessions
+    GetType() string // "ssh" or "local"
+    GetHost() string
+    GetUser() string
     GetStatus() Status
     SetStatus(Status)
     Close() error
     IsLocal() bool
+    GetCreatedAt() time.Time
+    GetLastCmd() string
+    SetLastCmd(cmd string)
 }
 ```
-
-### SSH Session (internal/session/ssh_session.go)
-
-```go
-type SSHSession struct {
-    Name      string
-    Host      string
-    User      string
-    Port      int
-    Password  string       // In-memory only, not persisted
-    KeyPath   string
-    Status    Status
-    Client    *ssh.Client  // golang.org/x/crypto/ssh.Client
-    CreatedAt time.Time
-    LastCmd   string
-    mu        sync.RWMutex
-}
-```
-
-### Local Session (internal/session/local_session.go)
-
-```go
-type LocalSession struct {
-    Name      string       // Auto-generated: "local-{hostname}"
-    Host      string       // Always "local"
-    User      string       // Current OS user
-    Status    Status       // Always "connected" (no reconnect needed)
-    CreatedAt time.Time
-    LastCmd   string
-    mu        sync.RWMutex
-}
-```
-
-Local sessions have no reconnect, no port forwarding, no file transfer — just command execution.
-They exist so agents can manage both remote and local operations under the same session framework.
 
 ### Status Lifecycle
 
 ```
 connecting → connected → disconnected (after kill)
                        → reconnecting → connected / offline
-                       → offline → (use -p/-i → connected)
+                       → offline → (use -p/-i or restore auto-reconnect → connected)
 ```
 
-- **connected**: SSH alive, session usable
-- **disconnected**: SSH closed (after kill)
-- **reconnecting**: connection lost, attempting reconnect
-- **offline**: reconnect failed, agent must `use -p/-i` to restore
+### Manager
 
-### Manager (internal/session/manager.go)
+`Manager` owns `map[string]Session` plus a default-session name. Key
+behaviors:
 
-```go
-type Manager struct {
-    sessions map[string]Session  // keyed by Name
-    default  string              // default session name
-    mu       sync.RWMutex
-}
-
-func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPath string) (*SSHSession, error)
-func (m *Manager) ConnectLocal(name string) (*LocalSession, error)
-func (m *Manager) Detach(name string) error
-func (m *Manager) Attach(name string) error    // For SSH: just set status, for Local: no-op
-func (m *Manager) Kill(name string) error
-func (m *Manager) List() []Session
-func (m *Manager) Use(name string) error
-func (m *Manager) Get(name string) (Session, error)
-func (m *Manager) GetDefault() (Session, error)
-func (m *Manager) KillAll()
-```
+- `ConnectSSH` dedups on name: same user+host+port returns the existing
+  session; same name with a different host is rejected.
+- New SSH connections dial **outside** the manager lock; state is re-validated
+  after the dial to avoid racing kill/use.
+- `Use(name, password, keyPath)` sets the default and, for offline SSH
+  sessions, updates credentials and reconnects.
+- `Reconnect(name)` reconnects without touching the default (state restore).
 
 ### Naming Rules
 
-- Name must match `[a-zA-Z0-9_-]`, 1-64 chars
-- SSH session auto-name if not provided: `{user}@{host}` (e.g. `admin@10.0.1.1`)
-- Local session auto-name: `local` (only one local session, auto-created on daemon start)
-- Dedup: same user+host+port returns existing session
+- SSH session auto-name: `{user}@{host}`; local auto-name: `local`.
+- Only one local session per name; local sessions never reconnect/forward/transfer.
 
 ## 6. Command Execution
 
-### Executor (internal/exec/executor.go)
+`internal/exec/executor.go` holds the full matrix:
+remote/local × buffered/stream × normal/sudo.
 
-Unified executor that dispatches to remote or local based on session type:
+- Commands are wrapped as `/bin/bash -c <shellquote.Quote(command)>`
+  (locally executed via `/bin/sh -c`). Quoting uses POSIX single-quote
+  escaping (`internal/shellquote`), **not** Go's `%q` — `%q` corrupts
+  newlines and control characters inside the command string.
+- No PTY; stdout/stderr are separate pipes in all modes.
+- Timeout: goroutine + timer; on timeout the process group is SIGKILLed and
+  the result is exit code **-1** plus a "command timed out" error.
+- A non-zero exit status is not a Go error — it is returned as `ExitCode`.
 
-```go
-type Executor struct {
-    sessions *session.Manager
-    audit    *audit.Logger
-}
+### Sudo (safe, no shell injection)
 
-func (e *Executor) Exec(sessionName, command string, timeout int, sudoOpts *SudoOptions) (*ExecResult, error)
+```
+sudo [-i | -u <quoted user>] -S -p '' /bin/bash -c '<quoted command>'
 ```
 
-### Remote Execution (internal/exec/remote.go)
-
-```go
-func execRemote(client *ssh.Client, command string, timeout int, sudoOpts *SudoOptions) (*ExecResult, error)
-```
-
-- Always shell-wrap: `fullCmd = /bin/sh -c <quoted command>`
-- No PTY, no CombinedOutput — stdout/stderr via Pipe separation
-- Timeout: goroutine + timer, SIGKILL on timeout
-
-### Local Execution (internal/exec/local.go)
-
-```go
-func execLocal(command string, timeout int, sudoOpts *SudoOptions) (*ExecResult, error)
-```
-
-- Uses `os/exec.Cmd` with StdoutPipe/StderrPipe
-- Always shell-wrap: `/bin/sh -c <quoted command>`
-- Same timeout mechanism as remote
-
-### Sudo (internal/exec/sudo.go)
-
-Safe sudo implementation — NO shell concatenation of passwords:
-
-```go
-type SudoOptions struct {
-    Enabled  bool
-    Password string
-    User     string   // -u user
-    Login    bool     // -i login shell
-}
-
-// Implementation: sudo -S via stdin
-// 1. Build sudo command with -S -p ''
-// 2. Start command
-// 3. Write password + "\n" to stdin
-// 4. Close stdin and wait for completion
-
-func writePassword(stdin io.WriteCloser, password string) error
-func buildSudoCommand(sudoOpts *SudoOptions, command string) string
-```
-
-### ExecResult
-
-```go
-type ExecResult struct {
-    Stdout   string `json:"stdout"`
-    Stderr   string `json:"stderr"`
-    ExitCode int    `json:"exit_code"`
-}
-```
-
-### Quick Local Exec (MsgLocalExec)
-
-For one-off local commands without needing a session:
-
-```go
-// Direct local exec — no session required
-func (e *Executor) ExecLocal(command string, timeout int, sudoOpts *SudoOptions) (*ExecResult, error)
-```
+The password is written to stdin (`-S`) and stdin is closed; passwords are
+never concatenated into the command line. The sudo user name is shell-quoted.
 
 ## 7. Port Forwarding
 
-### Service (internal/portforward/service.go)
+`internal/portforward/forwarder.go` holds both the `Forwarder` (one forward)
+and the `Service` (registry keyed by full UUID).
 
-```go
-type Service struct {
-    sessions *session.Manager
-    forwards map[string]*Forwarder   // keyed by UUID (full, not truncated)
-    mu       sync.RWMutex
-}
-
-func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int) (*ForwardInfo, error)
-func (s *Service) List() []*ForwardInfo
-func (s *Service) Close(forwardID string) error
-func (s *Service) RestartAll(sessionName string) error   // After reconnect
-```
-
-### Forwarder (internal/portforward/forwarder.go)
-
-Same design as gssh but with improved lifecycle:
-
-```go
-type Forwarder struct {
-    ID         string
-    Session    string           // session name
-    Type       string           // "local" | "remote"
-    LocalPort  int
-    RemotePort int
-    sshClient  *ssh.Client
-    listener   net.Listener
-    conns      map[net.Conn]bool
-    closed     bool
-    wg         sync.WaitGroup
-    lifecycleMu sync.Mutex
-}
-```
-
-- **Local forward**: `localhost:localPort → SSH tunnel → remote:remotePort`
-- **Remote forward**: `remote:remotePort → SSH tunnel → localhost:localPort`
-- Both use bidirectional `io.Copy`
-- `Restart(newSSHClient)` for reconnect recovery (stops old goroutines first)
+- Local forward: `localhost:localPort → SSH tunnel → 127.0.0.1:remotePort` (remote side).
+- Remote forward: `bindAddr:remotePort` on the server → `127.0.0.1:localPort` locally;
+  bind defaults to `127.0.0.1`, `--public` selects `0.0.0.0`.
+- `Close` accepts a full ID or an unambiguous prefix (the CLI prints 8-char
+  prefixes); ambiguous prefixes are rejected.
+- `RestartAll(sessionName, newClient)` re-creates listeners after reconnect;
+  local listeners re-bind, remote listeners re-Listen on the new connection.
 
 ## 8. File Transfer
 
-### SFTP Service (internal/transfer/sftp.go)
-
-```go
-type Service struct {
-    sessions *session.Manager
-}
-
-func (s *Service) Upload(sessionName, localPath, remotePath string) (*TransferResult, error)
-func (s *Service) Download(sessionName, remotePath, localPath string) (*TransferResult, error)
-func (s *Service) ListDir(sessionName, path string) ([]string, error)
-func (s *Service) Mkdir(sessionName, path string) error
-func (s *Service) Remove(sessionName, path string) error
-```
-
-Only available for SSH sessions. Local sessions return error "not available for local session".
-
-- Incremental sync: skip files with same size+mtime
-- Path traversal check: `filepath.IsLocal()` for downloads
-- Permission sync: preserve file mode on both sides
+SFTP (`github.com/pkg/sftp`) over the session's SSH connection; SSH sessions
+only. Upload/download recurse into directories; `sync` semantics skip files
+with identical size+mtime. Downloads are guarded against path traversal with
+`filepath.IsLocal()`.
 
 ## 9. Reconnect Monitor
 
-### Monitor (internal/reconnect/monitor.go)
+`internal/reconnect/monitor.go`:
 
-```go
-type Monitor struct {
-    sessions *session.Manager
-    forwards *portforward.Service
-}
-
-func (m *Monitor) Watch(s *SSHSession)   // Start watching an SSH session
-```
-
-**Exponential backoff**: 5s → 10s → 20s → 40s → max 5min
-- Success resets backoff to 5s
-- Health check: `ssh.Client.SendRequest("keepalive@agmux", true, nil)` with 5s timeout
-- After reconnect success: call `forwards.RestartAll(sessionName)` to restore forwards
+- Watches each connected SSH session; health check every 5s via
+  `keepalive@gssh` SSH request with a 5s timeout.
+- On failure: status → `reconnecting`, redial with stored credentials.
+  Backoff: 5s → 10s → 20s → ... → max 5min, reset on success.
+- On success: status → `connected`, then `forwards.RestartAll`.
+- `kill` stops the watch; `use` on an offline session re-arms it.
 
 ## 10. State Persistence
 
-### Store (internal/persist/store.go)
+`~/.gssh/state.json` (0600), written on graceful shutdown:
 
 ```go
-type Store struct {
-    path string   // ~/.sshmux/state.json  (TODO: rename to ~/.agmux/state.json)
-}
-
 type SessionState struct {
-    Name      string    `json:"name"`
-    Type      string    `json:"type"`     // "ssh" or "local"
-    Host      string    `json:"host"`
-    User      string    `json:"user"`
-    Port      int       `json:"port,omitempty"`
-    KeyPath   string    `json:"key_path,omitempty"`
-    Status    string    `json:"status"`
-    CreatedAt time.Time `json:"created_at"`
-    // Password NOT persisted
+    Name      string `json:"name"`
+    Type      string `json:"type"` // "ssh" or "local"
+    Host      string `json:"host"`
+    User      string `json:"user"`
+    Port      int    `json:"port,omitempty"`
+    KeyPath   string `json:"key_path,omitempty"`
+    Status    string `json:"status"`
+    CreatedAt int64  `json:"created_at"`
+    // Password deliberately NOT persisted
 }
-
-func (s *Store) Save(sessions []*SessionState) error
-func (s *Store) Load() ([]*SessionState, error)
 ```
-
-On daemon startup:
-- Load state from disk
-- Auto-create local session
-- SSH sessions: attempt reconnect (status `connected`)
-  - If no password/key available → status `offline`, agent must `use -p password`
-  - If key available → auto-reconnect
 
 ## 11. Audit Logging
 
-### Logger (internal/audit/log.go)
-
-```go
-type Logger struct {
-    file *os.File    // ~/.agmux/audit.log
-}
-
-type Entry struct {
-    Timestamp time.Time `json:"timestamp"`
-    Session   string    `json:"session"`
-    Action    string    `json:"action"`    // connect, use, kill, exec, forward, etc.
-    Command   string    `json:"cmd,omitempty"`
-    Result    string    `json:"result"`    // success, error, timeout
-    Detail    string    `json:"detail,omitempty"`
-}
-
-func (l *Logger) Log(entry Entry) error   // Append one JSON line
-```
+Every action (connect, use, kill, exec, forward, transfer, ...) is appended
+as one JSON line to `~/.gssh/audit.log` (0600). Result is `success`, `error`,
+or `exit_<code>` for exec.
 
 ## 12. Security
 
-1. **Socket auth**: Unix socket with `0600` permissions. Only the OS user who started the daemon can connect. Same model as tmux.
-2. **Sudo safety**: Password via `sudo -S` stdin write. Never shell-concatenated.
-3. **Password handling**: Not persisted to disk. In memory only during session lifetime.
-4. **Path traversal**: `filepath.IsLocal()` check for SFTP downloads.
-5. **Audit log**: Every action logged to `~/.agmux/audit.log`.
+1. **Socket auth**: Unix socket 0600 under a per-user directory; both client
+   and server validate ownership and permissions (`internal/socketpath`).
+2. **Peer credentials**: the client verifies the daemon's UID via
+   `LOCAL_PEERCRED` (macOS) / `SO_PEERCRED` (Linux); no-op elsewhere.
+3. **Sudo safety**: password via `sudo -S` stdin only; usernames shell-quoted.
+4. **Shell quoting**: all command wrapping uses POSIX single-quote escaping;
+   no string is ever embedded raw into a shell command line.
+5. **Password handling**: never persisted; memory only for session lifetime.
+6. **Path traversal**: `filepath.IsLocal()` check for SFTP downloads.
+7. **Host keys**: `known_hosts` enforced; unknown keys rejected unless
+   `GSSH_INSECURE_ACCEPT_NEW_HOST_KEYS=1` (TOFU opt-in); mismatches always rejected.
 
 ## 13. CLI Commands
 
 ```
-agmux start                                  # Start daemon (fork to background)
-agmux connect -u user -h host [-P port] [-n name] [-p password] [-i key]
-agmux local [-n name]                        # Create local session
-agmux kill [-n name]                         # Kill session (close SSH)
-agmux exec [-n name] [-t timeout] [--sudo ...] "command"
-agmux run [-t timeout] [--sudo ...] "command" # One-off local exec (no session)
-agmux list | ls                              # List sessions
-agmux use <name> [-p password] [-i key]      # Switch default / reconnect session
-agmux forward [-n name] -l local -r remote [-R] [--bind addr|--public]
-agmux forwards                               # List forwards
-agmux forward-close <id>
-agmux scp [-n name] -put|-get <src> <dst>
-agmux sync [-n name] -put|-get <src> <dst>
-agmux sftp [-n name] -c ls|mkdir|rm -d <path>
-agmux ping                                   # Check daemon alive
-agmux stop                                   # Stop daemon gracefully
-agmux -v, --version
-agmux -S <socket_path>                       # Override socket path
+gssh connect -u user -h host [-P port] [-n name] [-p password] [-i key]
+gssh local [-n name]
+gssh kill [-n name]
+gssh exec [-n name] [-t timeout] [--stream] [--json] [--sudo ...] "command"
+gssh run [-t timeout] [--stream] [--json] [--sudo ...] "command"
+gssh list | ls [--json]
+gssh use <name> [-p password] [-i key]
+gssh forward [-n name] -l local -r remote [-R] [--bind addr|--public]
+gssh forwards [--json]
+gssh forward-close <id-or-prefix>
+gssh scp|sync [-n name] -put|-get <src> <dst>
+gssh sftp [-n name] -c ls|mkdir|rm -p <path>
+gssh ping
+gssh start | stop
+gssh server                                  # daemon in foreground (internal)
+gssh -v, --version
+gssh -S <socket_path>                        # global, before the subcommand
 ```
 
-Global flags:
-- `-S socket_path`: Override socket path (default: `$XDG_RUNTIME_DIR/agmux/agmux.sock`, fallback `~/.agmux/run/agmux.sock`)
-- `-v, --version`: Show version
+Client RPC deadlines: 10s default; 30s for connect/use (SSH dial budget);
+`-t N` exec extends the deadline to N + 30s; unlimited `--stream` has no deadline.
 
-## 14. Implementation Order
-
-1. pkg/imsg (protocol foundation)
-2. internal/protocol (message types)
-3. internal/ssh (SSH client)
-4. internal/session (session model + manager)
-5. internal/exec (command execution, both remote and local)
-6. internal/server (server core + dispatch)
-7. cmd/agmux-server (daemon entry point)
-8. cmd/agmux (CLI client)
-9. internal/portforward
-10. internal/transfer
-11. internal/reconnect
-12. internal/persist
-13. internal/audit
-14. Tests
-
-## 15. Dependencies
+## 14. Dependencies
 
 ```
-golang.org/x/crypto/ssh            # SSH client library
-golang.org/x/crypto/ssh/knownhosts # TOFU host key
+golang.org/x/crypto/ssh            # SSH client
+golang.org/x/crypto/ssh/knownhosts # host key verification
+golang.org/x/sys/unix              # setsid, peer credentials
 github.com/pkg/sftp                # SFTP client
-github.com/google/uuid              # UUID for forward IDs
+github.com/google/uuid             # forward IDs
 ```

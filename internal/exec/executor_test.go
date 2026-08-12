@@ -6,7 +6,7 @@ import (
 	"os"
 	"testing"
 
-	"agmux/internal/protocol"
+	"gssh/internal/protocol"
 )
 
 func TestLocalExecSimple(t *testing.T) {

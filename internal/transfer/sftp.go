@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"agmux/internal/protocol"
-	"agmux/internal/session"
+	"gssh/internal/protocol"
+	"gssh/internal/session"
 
 	"github.com/pkg/sftp"
 	"golang.org/x/sys/unix"

@@ -74,3 +74,57 @@ func TestStartRemoteForwardUsesJoinHostPortForIPv6(t *testing.T) {
 		t.Fatalf("remote address = %q, want [::1]:9000", gotAddr)
 	}
 }
+
+func newStubForwarder(id string) *Forwarder {
+	return &Forwarder{ID: id, Type: "local", conns: make(map[net.Conn]bool)}
+}
+
+func TestServiceCloseByFullID(t *testing.T) {
+	svc := &Service{forwards: map[string]*Forwarder{"abcd1234-full-uuid": newStubForwarder("abcd1234-full-uuid")}}
+
+	if err := svc.Close("abcd1234-full-uuid"); err != nil {
+		t.Fatalf("Close(full ID) failed: %v", err)
+	}
+	if len(svc.forwards) != 0 {
+		t.Fatal("forwarder was not removed")
+	}
+}
+
+func TestServiceCloseByUniquePrefix(t *testing.T) {
+	svc := &Service{forwards: map[string]*Forwarder{
+		"aaaa1111-full-uuid": newStubForwarder("aaaa1111-full-uuid"),
+		"bbbb2222-full-uuid": newStubForwarder("bbbb2222-full-uuid"),
+	}}
+
+	if err := svc.Close("aaaa1111"); err != nil {
+		t.Fatalf("Close(prefix) failed: %v", err)
+	}
+	if _, ok := svc.forwards["bbbb2222-full-uuid"]; !ok {
+		t.Fatal("unrelated forwarder was removed")
+	}
+}
+
+func TestServiceCloseAmbiguousPrefix(t *testing.T) {
+	svc := &Service{forwards: map[string]*Forwarder{
+		"aaaa1111-full-uuid": newStubForwarder("aaaa1111-full-uuid"),
+		"aaaa2222-full-uuid": newStubForwarder("aaaa2222-full-uuid"),
+	}}
+
+	if err := svc.Close("aaaa"); err == nil {
+		t.Fatal("expected ambiguous prefix error")
+	}
+	if len(svc.forwards) != 2 {
+		t.Fatal("forwarders were removed despite ambiguity")
+	}
+}
+
+func TestServiceCloseRejectsEmptyAndUnknownID(t *testing.T) {
+	svc := &Service{forwards: map[string]*Forwarder{"abcd1234-full-uuid": newStubForwarder("abcd1234-full-uuid")}}
+
+	if err := svc.Close(""); err == nil {
+		t.Fatal("expected error for empty ID")
+	}
+	if err := svc.Close("ffff"); err == nil {
+		t.Fatal("expected error for unknown ID")
+	}
+}

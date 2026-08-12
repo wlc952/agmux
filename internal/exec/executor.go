@@ -8,8 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"agmux/internal/protocol"
-	"agmux/internal/session"
+	"gssh/internal/protocol"
+	"gssh/internal/session"
+	"gssh/internal/shellquote"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -102,7 +103,7 @@ func runRemoteStream(client *ssh.Client, command string, timeout int, sudoOpts *
 	}
 	defer sshSession.Close()
 
-	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
+	fullCmd := "/bin/bash -c " + shellquote.Quote(command)
 
 	if sudoOpts != nil && sudoOpts.Enabled {
 		return runRemoteSudoStream(sshSession, fullCmd, sudoOpts, timeout, stdoutW, stderrW)
@@ -194,7 +195,7 @@ func sshExitCode(err error) (int, error) {
 // --- Local streaming execution ---
 
 func runLocalStream(command string, timeout int, sudoOpts *protocol.SudoOptions, stdoutW, stderrW io.Writer) (int, error) {
-	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
+	fullCmd := "/bin/bash -c " + shellquote.Quote(command)
 
 	if sudoOpts != nil && sudoOpts.Enabled {
 		return runLocalSudoStream(fullCmd, sudoOpts, timeout, stdoutW, stderrW)
@@ -320,7 +321,7 @@ func runRemote(client *ssh.Client, command string, timeout int, sudoOpts *protoc
 	}
 	defer sshSession.Close()
 
-	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
+	fullCmd := "/bin/bash -c " + shellquote.Quote(command)
 
 	if sudoOpts != nil && sudoOpts.Enabled {
 		return runRemoteSudo(sshSession, fullCmd, sudoOpts, timeout)
@@ -426,7 +427,7 @@ func runRemoteSudo(sshSession *ssh.Session, fullCmd string, sudoOpts *protocol.S
 // --- Local execution ---
 
 func runLocal(command string, timeout int, sudoOpts *protocol.SudoOptions) (*protocol.ExecResult, error) {
-	fullCmd := fmt.Sprintf("/bin/bash -c %q", command)
+	fullCmd := "/bin/bash -c " + shellquote.Quote(command)
 
 	if sudoOpts != nil && sudoOpts.Enabled {
 		return runLocalSudo(fullCmd, sudoOpts, timeout)
@@ -552,7 +553,7 @@ func buildSudoPrefix(sudoOpts *protocol.SudoOptions) string {
 		return "sudo -i"
 	}
 	if sudoOpts.User != "" {
-		return fmt.Sprintf("sudo -u %s", sudoOpts.User)
+		return fmt.Sprintf("sudo -u %s", shellquote.Quote(sudoOpts.User))
 	}
 	return "sudo"
 }

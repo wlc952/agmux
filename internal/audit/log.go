@@ -19,7 +19,7 @@ type Entry struct {
 	Detail    string    `json:"detail,omitempty"`
 }
 
-// Logger writes audit entries to ~/.agmux/audit.log.
+// Logger writes audit entries to ~/.gssh/audit.log.
 type Logger struct {
 	file *os.File
 	mu   sync.Mutex
@@ -33,7 +33,7 @@ func NewLogger() *Logger {
 		return &Logger{}
 	}
 
-	logger, err := NewLoggerAt(filepath.Join(homeDir, ".agmux", "audit.log"))
+	logger, err := NewLoggerAt(filepath.Join(homeDir, ".gssh", "audit.log"))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open audit log: %v\n", err)
 		return &Logger{}

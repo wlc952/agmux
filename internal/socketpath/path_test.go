@@ -10,7 +10,7 @@ import (
 func TestDefaultPrefersXDG(t *testing.T) {
 	runtimeDir := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
-	if got, want := Default(), filepath.Join(runtimeDir, "agmux", "agmux.sock"); got != want {
+	if got, want := Default(), filepath.Join(runtimeDir, "gssh", "gssh.sock"); got != want {
 		t.Fatalf("Default() = %s, want %s", got, want)
 	}
 }

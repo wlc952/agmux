@@ -9,17 +9,17 @@ import (
 	"sync"
 	"time"
 
-	"agmux/internal/audit"
-	"agmux/internal/exec"
-	"agmux/internal/persist"
-	"agmux/internal/portforward"
-	"agmux/internal/protocol"
-	"agmux/internal/reconnect"
-	"agmux/internal/session"
-	"agmux/internal/socketpath"
-	"agmux/internal/transfer"
+	"gssh/internal/audit"
+	"gssh/internal/exec"
+	"gssh/internal/persist"
+	"gssh/internal/portforward"
+	"gssh/internal/protocol"
+	"gssh/internal/reconnect"
+	"gssh/internal/session"
+	"gssh/internal/socketpath"
+	"gssh/internal/transfer"
 
-	"agmux/pkg/imsg"
+	"gssh/pkg/imsg"
 )
 
 // Server is the core daemon that listens on a Unix socket and dispatches commands.
@@ -214,6 +214,16 @@ func (s *Server) handleConn(conn net.Conn) {
 		if err != nil {
 			// Send error response
 			errPayload, _ := json.Marshal(protocol.ErrorPayload{Code: -32000, Message: err.Error()})
+			response = imsg.NewImsg(protocol.MsgError, errPayload)
+		}
+
+		// Guard against oversized payloads (e.g. huge buffered exec output):
+		// fail with a clear error instead of dying mid-write or dropping the conn.
+		if len(response.Payload) > imsg.MaxPayloadSize {
+			errPayload, _ := json.Marshal(protocol.ErrorPayload{
+				Code:    -32000,
+				Message: fmt.Sprintf("response exceeds %d bytes; re-run with --stream for large output", imsg.MaxPayloadSize),
+			})
 			response = imsg.NewImsg(protocol.MsgError, errPayload)
 		}
 
@@ -497,11 +507,25 @@ func (s *Server) restoreState() {
 			continue
 		}
 
-		// SSH sessions: register as offline (agent must re-use with credentials)
+		// SSH sessions: register as offline, then auto-reconnect in the
+		// background when key auth is available (passwords are never
+		// persisted, so password sessions must be restored manually via
+		// `gssh use <name> -p password`).
 		s.sessions.RegisterOfflineSession(
 			state.Name, state.User, state.Host, state.Port,
 			state.KeyPath, time.Unix(state.CreatedAt, 0),
 		)
+		if state.KeyPath != "" {
+			go func(name string) {
+				sess, err := s.sessions.Reconnect(name)
+				if err != nil {
+					log.Printf("[server] Auto-reconnect of restored session %s failed: %v", name, err)
+					return
+				}
+				s.reconnect.Watch(sess)
+				log.Printf("[server] Restored session %s via key auth", name)
+			}(state.Name)
+		}
 	}
 }
 

@@ -6,252 +6,12 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"agmux/internal/protocol"
-	"agmux/internal/socketpath"
-	"agmux/pkg/imsg"
+	"gssh/internal/protocol"
+	"gssh/internal/socketpath"
 )
-
-var (
-	socketPath string
-	version    = "dev"
-)
-
-const rpcTimeout = 10 * time.Second
-
-// socketDeadlineBuffer is the extra time added on top of the user-specified
-// command timeout to give the server room to finish and respond before the
-// client socket deadline fires.
-const socketDeadlineBuffer = 30 * time.Second
-
-func main() {
-	// Parse global -S flag first
-	args := os.Args[1:]
-	socketPath = defaultSocketPath()
-	for i := 0; i < len(args); i++ {
-		if args[i] == "-S" && i+1 < len(args) {
-			socketPath = args[i+1]
-			args = append(args[:i], args[i+2:]...)
-			i--
-		}
-	}
-
-	if len(args) > 0 && (args[0] == "-v" || args[0] == "--version") {
-		fmt.Printf("agmux version %s\n", version)
-		os.Exit(0)
-	}
-
-	if len(args) > 0 && (args[0] == "-h" || args[0] == "--help") {
-		printUsage()
-		os.Exit(0)
-	}
-
-	if len(args) < 1 {
-		printUsage()
-		os.Exit(1)
-	}
-
-	cmd := args[0]
-	subArgs := args[1:]
-
-	var err error
-	switch cmd {
-	case "start":
-		err = handleStart()
-	case "connect":
-		err = handleConnect(subArgs)
-	case "local":
-		err = handleLocal(subArgs)
-	case "kill":
-		err = handleKill(subArgs)
-	case "exec":
-		err = handleExec(subArgs)
-	case "run":
-		err = handleRun(subArgs)
-	case "list", "ls":
-		err = handleList()
-	case "use":
-		err = handleUse(subArgs)
-	case "forward":
-		err = handleForward(subArgs)
-	case "forwards":
-		err = handleForwards()
-	case "forward-close":
-		err = handleForwardClose(subArgs)
-	case "scp", "sync":
-		err = handleSCP(subArgs)
-	case "sftp":
-		err = handleSFTP(subArgs)
-	case "ping":
-		err = handlePing()
-	case "stop":
-		err = handleStop()
-	case "help":
-		printUsage()
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
-		printUsage()
-		os.Exit(1)
-	}
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-// sendRequest sends an RPC request and waits for a response using the default
-// rpcTimeout for both connection and response.
-func sendRequest(method uint16, params interface{}) ([]byte, error) {
-	return sendRequestWithTimeout(method, params, rpcTimeout)
-}
-
-// sendRequestWithCmdTimeout is like sendRequest but extends the socket deadline
-// to accommodate a user-specified command timeout (e.g. from -t flag).
-// cmdTimeoutSecs == 0 means no command timeout → use rpcTimeout.
-func sendRequestWithCmdTimeout(method uint16, params interface{}, cmdTimeoutSecs int) ([]byte, error) {
-	deadline := rpcTimeout
-	if cmdTimeoutSecs > 0 {
-		deadline = time.Duration(cmdTimeoutSecs)*time.Second + socketDeadlineBuffer
-	}
-	return sendRequestWithTimeout(method, params, deadline)
-}
-
-func sendRequestWithTimeout(method uint16, params interface{}, deadline time.Duration) ([]byte, error) {
-	if err := socketpath.Validate(socketPath); err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
-		}
-		return nil, err
-	}
-
-	conn, err := net.DialTimeout("unix", socketPath, rpcTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
-	}
-	defer conn.Close()
-	if err := verifyDaemonPeer(conn); err != nil {
-		return nil, err
-	}
-	if err := conn.SetDeadline(time.Now().Add(deadline)); err != nil {
-		return nil, fmt.Errorf("failed to set RPC deadline: %w", err)
-	}
-
-	var payload []byte
-	if params != nil {
-		payload, err = protocol.EncodePayload(params)
-		if err != nil {
-			return nil, fmt.Errorf("failed to encode params: %w", err)
-		}
-	} else {
-		payload = []byte{}
-	}
-
-	msg := imsg.NewImsg(method, payload)
-	if err := imsg.WriteMessage(conn, msg); err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-
-	resp, err := imsg.ReadMessage(conn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.Type == protocol.MsgError {
-		var errPayload protocol.ErrorPayload
-		if err := json.Unmarshal(resp.Payload, &errPayload); err != nil {
-			return nil, fmt.Errorf("RPC error (unparseable)")
-		}
-		return nil, fmt.Errorf("RPC error: %s", errPayload.Message)
-	}
-
-	return resp.Payload, nil
-}
-
-// sendStreamRequest sends a streaming exec request and prints output chunks to
-// stdout/stderr as they arrive, blocking until the server sends MsgStreamEnd.
-// When cmdTimeoutSecs > 0 the socket deadline is set to timeout + buffer;
-// when cmdTimeoutSecs == 0 (unlimited) no deadline is imposed.
-func sendStreamRequest(method uint16, params interface{}, cmdTimeoutSecs int) error {
-	if err := socketpath.Validate(socketPath); err != nil {
-		if os.IsNotExist(err) {
-			return fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
-		}
-		return err
-	}
-
-	conn, err := net.DialTimeout("unix", socketPath, rpcTimeout)
-	if err != nil {
-		return fmt.Errorf("failed to connect to daemon (is it running?): %w", err)
-	}
-	defer conn.Close()
-	if err := verifyDaemonPeer(conn); err != nil {
-		return err
-	}
-	if cmdTimeoutSecs > 0 {
-		deadline := time.Duration(cmdTimeoutSecs)*time.Second + socketDeadlineBuffer
-		if err := conn.SetDeadline(time.Now().Add(deadline)); err != nil {
-			return fmt.Errorf("failed to set deadline: %w", err)
-		}
-	}
-	// When cmdTimeoutSecs == 0, no deadline: the connection waits as long as needed.
-
-	payload, err := protocol.EncodePayload(params)
-	if err != nil {
-		return fmt.Errorf("failed to encode params: %w", err)
-	}
-
-	if err := imsg.WriteMessage(conn, imsg.NewImsg(method, payload)); err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
-	}
-
-	for {
-		msg, err := imsg.ReadMessage(conn)
-		if err != nil {
-			return fmt.Errorf("failed to read stream: %w", err)
-		}
-
-		switch msg.Type {
-		case protocol.MsgStreamChunk:
-			var chunk protocol.StreamChunk
-			if err := json.Unmarshal(msg.Payload, &chunk); err != nil {
-				return fmt.Errorf("failed to decode chunk: %w", err)
-			}
-			if chunk.Stream == "stderr" {
-				os.Stderr.Write(chunk.Data)
-			} else {
-				os.Stdout.Write(chunk.Data)
-			}
-
-		case protocol.MsgStreamEnd:
-			var end protocol.StreamEnd
-			if err := json.Unmarshal(msg.Payload, &end); err != nil {
-				return fmt.Errorf("failed to decode stream end: %w", err)
-			}
-			if end.Error != "" {
-				return fmt.Errorf("%s", end.Error)
-			}
-			if end.ExitCode != 0 {
-				os.Exit(end.ExitCode)
-			}
-			return nil
-
-		case protocol.MsgError:
-			var errPayload protocol.ErrorPayload
-			if err := json.Unmarshal(msg.Payload, &errPayload); err != nil {
-				return fmt.Errorf("RPC error (unparseable)")
-			}
-			return fmt.Errorf("RPC error: %s", errPayload.Message)
-
-		default:
-			return fmt.Errorf("unexpected message type during stream: %d", msg.Type)
-		}
-	}
-}
 
 func handleStart() error {
 	// Check if daemon is already running
@@ -269,25 +29,22 @@ func handleStart() error {
 			fmt.Println("Daemon is already running")
 			return nil
 		}
+		// Stale socket: the freshly spawned server removes it before listening.
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("failed to inspect socket path: %w", err)
 	}
 
-	// Fork daemon process
-	serverBin, err := findServerBinary()
-	if err != nil {
-		return fmt.Errorf("cannot find agmux-server binary: %w", err)
-	}
-
-	// Start daemon in background
-	cmd := exec.Command(serverBin, "-S", socketPath)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Start(); err != nil {
+	if err := startDaemon(); err != nil {
 		return fmt.Errorf("failed to start daemon: %w", err)
 	}
 
-	fmt.Printf("Daemon started (PID: %d, socket: %s)\n", cmd.Process.Pid, socketPath)
+	conn, err := waitForDaemon()
+	if err != nil {
+		return err
+	}
+	conn.Close()
+
+	fmt.Printf("Daemon started (socket: %s, log: %s)\n", socketPath, daemonLogPath())
 	return nil
 }
 
@@ -317,7 +74,7 @@ func handleConnect(args []string) error {
 		KeyPath:  *keyPath,
 	}
 
-	result, err := sendRequest(protocol.MsgConnect, params)
+	result, err := sendRequestWithTimeout(protocol.MsgConnect, params, connectRPCTimeout)
 	if err != nil {
 		return err
 	}
@@ -365,11 +122,11 @@ func handleUse(args []string) error {
 		return fmt.Errorf("session name required")
 	}
 
-	_, err := sendRequest(protocol.MsgUse, protocol.UseParams{
+	_, err := sendRequestWithTimeout(protocol.MsgUse, protocol.UseParams{
 		Name:     fs.Arg(0),
 		Password: *password,
 		KeyPath:  *keyPath,
-	})
+	}, connectRPCTimeout)
 	if err != nil {
 		return err
 	}
@@ -399,6 +156,34 @@ func handleKill(args []string) error {
 	return nil
 }
 
+// printExecResult writes an exec result to stdout/stderr, either as raw
+// streams (default) or as a single JSON object (--json), and exits with the
+// command's exit code when non-zero.
+func printExecResult(result []byte, jsonOut bool) error {
+	var execResult protocol.ExecResult
+	if err := json.Unmarshal(result, &execResult); err != nil {
+		return fmt.Errorf("failed to parse result: %w", err)
+	}
+
+	if jsonOut {
+		data, err := json.Marshal(execResult)
+		if err != nil {
+			return fmt.Errorf("failed to encode result: %w", err)
+		}
+		fmt.Println(string(data))
+	} else {
+		fmt.Print(execResult.Stdout)
+		if execResult.Stderr != "" {
+			fmt.Fprintf(os.Stderr, "%s", execResult.Stderr)
+		}
+	}
+
+	if execResult.ExitCode != 0 {
+		os.Exit(execResult.ExitCode)
+	}
+	return nil
+}
+
 func handleExec(args []string) error {
 	fs := flag.NewFlagSet("exec", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -410,6 +195,7 @@ func handleExec(args []string) error {
 	sudoUser := fs.String("sudo-user", "", "Run as specified user")
 	sudoLogin := fs.Bool("sudo-login", false, "Login shell (-i)")
 	stream := fs.Bool("stream", false, "Stream output in real-time")
+	jsonOut := fs.Bool("json", false, "Print result as JSON")
 
 	fs.Parse(args)
 
@@ -441,21 +227,7 @@ func handleExec(args []string) error {
 		return err
 	}
 
-	var execResult protocol.ExecResult
-	if err := json.Unmarshal(result, &execResult); err != nil {
-		return fmt.Errorf("failed to parse result: %w", err)
-	}
-
-	fmt.Print(execResult.Stdout)
-	if execResult.Stderr != "" {
-		fmt.Fprintf(os.Stderr, "%s", execResult.Stderr)
-	}
-
-	if execResult.ExitCode != 0 {
-		os.Exit(execResult.ExitCode)
-	}
-
-	return nil
+	return printExecResult(result, *jsonOut)
 }
 
 func handleRun(args []string) error {
@@ -468,6 +240,7 @@ func handleRun(args []string) error {
 	sudoUser := fs.String("sudo-user", "", "Run as specified user")
 	sudoLogin := fs.Bool("sudo-login", false, "Login shell (-i)")
 	stream := fs.Bool("stream", false, "Stream output in real-time")
+	jsonOut := fs.Bool("json", false, "Print result as JSON")
 
 	fs.Parse(args)
 
@@ -498,21 +271,7 @@ func handleRun(args []string) error {
 		return err
 	}
 
-	var execResult protocol.ExecResult
-	if err := json.Unmarshal(result, &execResult); err != nil {
-		return fmt.Errorf("failed to parse result: %w", err)
-	}
-
-	fmt.Print(execResult.Stdout)
-	if execResult.Stderr != "" {
-		fmt.Fprintf(os.Stderr, "%s", execResult.Stderr)
-	}
-
-	if execResult.ExitCode != 0 {
-		os.Exit(execResult.ExitCode)
-	}
-
-	return nil
+	return printExecResult(result, *jsonOut)
 }
 
 func joinCommandArgs(args []string) string {
@@ -540,7 +299,12 @@ func shellQuote(arg string) string {
 	return "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
 }
 
-func handleList() error {
+func handleList(args []string) error {
+	fs := flag.NewFlagSet("list", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	jsonOut := fs.Bool("json", false, "Print result as JSON")
+	fs.Parse(args)
+
 	result, err := sendRequest(protocol.MsgList, nil)
 	if err != nil {
 		return err
@@ -549,6 +313,15 @@ func handleList() error {
 	var sessions []protocol.SessionInfo
 	if err := json.Unmarshal(result, &sessions); err != nil {
 		return fmt.Errorf("failed to parse result: %w", err)
+	}
+
+	if *jsonOut {
+		data, err := json.Marshal(sessions)
+		if err != nil {
+			return fmt.Errorf("failed to encode result: %w", err)
+		}
+		fmt.Println(string(data))
+		return nil
 	}
 
 	if len(sessions) == 0 {
@@ -629,7 +402,12 @@ func handleForward(args []string) error {
 	return nil
 }
 
-func handleForwards() error {
+func handleForwards(args []string) error {
+	fs := flag.NewFlagSet("forwards", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	jsonOut := fs.Bool("json", false, "Print result as JSON")
+	fs.Parse(args)
+
 	result, err := sendRequest(protocol.MsgForwards, nil)
 	if err != nil {
 		return err
@@ -638,6 +416,15 @@ func handleForwards() error {
 	var forwards []protocol.ForwardInfo
 	if err := json.Unmarshal(result, &forwards); err != nil {
 		return fmt.Errorf("failed to parse result: %w", err)
+	}
+
+	if *jsonOut {
+		data, err := json.Marshal(forwards)
+		if err != nil {
+			return fmt.Errorf("failed to encode result: %w", err)
+		}
+		fmt.Println(string(data))
+		return nil
 	}
 
 	if len(forwards) == 0 {
@@ -724,7 +511,8 @@ func handleSFTP(args []string) error {
 
 	name := fs.String("n", "", "Session name")
 	command := fs.String("c", "", "SFTP command (ls, mkdir, rm)")
-	path := fs.String("d", ".", "Remote path")
+	path := fs.String("p", "", "Remote path")
+	pathAlt := fs.String("d", "", "Remote path (deprecated alias for -p)")
 
 	fs.Parse(args)
 
@@ -732,9 +520,19 @@ func handleSFTP(args []string) error {
 		return fmt.Errorf("SFTP command required (-c ls|mkdir|rm)")
 	}
 
+	resolvedPath := *path
+	if resolvedPath == "" {
+		resolvedPath = *pathAlt
+	}
+	if resolvedPath == "" {
+		resolvedPath = "."
+	} else if *path != "" && *pathAlt != "" {
+		return fmt.Errorf("-p and -d cannot be used together")
+	}
+
 	switch *command {
 	case "ls":
-		params := protocol.SFTPParams{Name: *name, Command: "ls", Path: *path}
+		params := protocol.SFTPParams{Name: *name, Command: "ls", Path: resolvedPath}
 		result, err := sendRequest(protocol.MsgSFTPLs, params)
 		if err != nil {
 			return err
@@ -748,20 +546,20 @@ func handleSFTP(args []string) error {
 		}
 
 	case "mkdir":
-		params := protocol.SFTPParams{Name: *name, Command: "mkdir", Path: *path}
+		params := protocol.SFTPParams{Name: *name, Command: "mkdir", Path: resolvedPath}
 		_, err := sendRequest(protocol.MsgSFTPMkdir, params)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("Directory created: %s\n", *path)
+		fmt.Printf("Directory created: %s\n", resolvedPath)
 
 	case "rm":
-		params := protocol.SFTPParams{Name: *name, Command: "rm", Path: *path}
+		params := protocol.SFTPParams{Name: *name, Command: "rm", Path: resolvedPath}
 		_, err := sendRequest(protocol.MsgSFTPRm, params)
 		if err != nil {
 			return err
 		}
-		fmt.Printf("File removed: %s\n", *path)
+		fmt.Printf("File removed: %s\n", resolvedPath)
 
 	default:
 		return fmt.Errorf("unknown SFTP command: %s", *command)
@@ -786,78 +584,4 @@ func handleStop() error {
 	}
 	fmt.Println("Daemon stopping")
 	return nil
-}
-
-func findServerBinary() (string, error) {
-	// Try same directory as agmux binary
-	self, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	dir := filepath.Dir(self)
-	serverPath := filepath.Join(dir, "agmux-server")
-	if _, err := os.Stat(serverPath); err == nil {
-		return serverPath, nil
-	}
-
-	// Try /usr/local/bin
-	serverPath = "/usr/local/bin/agmux-server"
-	if _, err := os.Stat(serverPath); err == nil {
-		return serverPath, nil
-	}
-
-	return "", fmt.Errorf("agmux-server binary not found")
-}
-
-func defaultSocketPath() string {
-	return socketpath.Default()
-}
-
-func printUsage() {
-	fmt.Printf(`agmux - Agent Multiplexer v%s
-
-Usage:
-  agmux start                                    Start daemon
-  agmux connect -u user -h host [-n name] [-P port] [-p password] [-i key]
-  agmux local [-n name]                          Create local session
-  agmux kill [-n name]                           Kill session
-  agmux exec [-n name] [-t timeout] [--stream] [--sudo ...] "command"
-  agmux run [-t timeout] [--stream] [--sudo ...] "command"  One-off local exec
-  agmux list | ls                                List sessions
-  agmux use <name> [-p password] [-i key]        Switch default / reconnect session
-  agmux forward [-n name] -l local -r remote [-R] [--bind addr|--public]
-  agmux forwards                                 List forwards
-  agmux forward-close <id>
-  agmux scp [-n name] -put|-get <src> <dst>
-  agmux sync [-n name] -put|-get <src> <dst>
-  agmux sftp [-n name] -c ls|mkdir|rm -d <path>
-  agmux ping                                     Check daemon
-  agmux stop                                     Stop daemon
-  agmux -v, --version
-
-Options:
-  -S socket_path    Unix socket path (default: %s)
-  -n name           Session name
-  -u user           Username
-  -h host           Host address
-  -P port           SSH port (default: 22)
-  -p password       SSH password
-  -i key_path       SSH key path
-  -t timeout        Command timeout in seconds
-  --sudo            Run with sudo
-  --sudo-password   Sudo password
-  --sudo-user       Run as specified user
-  --sudo-login      Login shell (-i)
-  --stream          Stream stdout/stderr in real-time (for long-running commands)
-  --bind addr       Remote bind address for -R (default: 127.0.0.1)
-  --public          Shortcut for --bind 0.0.0.0
-
-Examples:
-  agmux connect -u admin -h 10.0.1.1 -n production -p password
-  agmux exec -n production "ls -la"
-  agmux exec --sudo --sudo-password 1234 "ls /root/"
-  agmux run "ls -la /tmp"
-  agmux use production -p password
-  agmux forward -n production -l 8080 -r 80
-`, version, defaultSocketPath())
 }

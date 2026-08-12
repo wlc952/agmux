@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	agssh "agmux/internal/ssh"
 	"golang.org/x/crypto/ssh"
+	sshclient "gssh/internal/ssh"
 )
 
 // Status represents a session's lifecycle state.
@@ -45,7 +45,7 @@ type SSHSession struct {
 	Password  string // in-memory only, not persisted
 	KeyPath   string
 	Status    Status
-	Client    *agssh.Client
+	Client    *sshclient.Client
 	CreatedAt time.Time
 	LastCmd   string
 	mu        sync.RWMutex
@@ -127,14 +127,14 @@ func (s *SSHSession) SetKeyPath(k string) {
 	s.mu.Unlock()
 }
 
-func (s *SSHSession) GetClient() *agssh.Client {
+func (s *SSHSession) GetClient() *sshclient.Client {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.Client
 }
 
 // SetClient sets the SSH client (for reconnect monitor).
-func (s *SSHSession) SetClient(client *agssh.Client) {
+func (s *SSHSession) SetClient(client *sshclient.Client) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Client = client
@@ -230,7 +230,7 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 			m.defaultName = name
 			m.mu.Unlock()
 
-			client, err := agssh.Connect(user, host, port, agssh.AuthConfig{Password: password, KeyPath: keyPath})
+			client, err := sshclient.Connect(user, host, port, sshclient.AuthConfig{Password: password, KeyPath: keyPath})
 			if err != nil {
 				sshSess.SetStatus(StatusOffline)
 				return nil, err
@@ -280,7 +280,7 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 	m.mu.Unlock()
 
 	// Connect outside of Manager lock
-	client, err := agssh.Connect(user, host, port, agssh.AuthConfig{Password: password, KeyPath: keyPath})
+	client, err := sshclient.Connect(user, host, port, sshclient.AuthConfig{Password: password, KeyPath: keyPath})
 	if err != nil {
 		m.mu.Lock()
 		delete(m.sessions, name)
@@ -481,6 +481,28 @@ func (m *Manager) RegisterOfflineSession(name, user, host string, port int, keyP
 	m.mu.Unlock()
 }
 
+// Reconnect restores an offline/disconnected SSH session using its stored
+// credentials without changing the default session. Used at daemon startup to
+// auto-reconnect key-based sessions restored from persisted state.
+func (m *Manager) Reconnect(name string) (*SSHSession, error) {
+	m.mu.RLock()
+	sess, ok := m.sessions[name]
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("session not found")
+	}
+	if sess.IsLocal() {
+		return nil, fmt.Errorf("session %q is not an SSH session", name)
+	}
+
+	sshSess := sess.(*SSHSession)
+	if err := m.reconnectSSH(sshSess); err != nil {
+		return nil, err
+	}
+	return sshSess, nil
+}
+
 // --- Internal helpers ---
 
 func (m *Manager) reconnectSSH(sess *SSHSession) error {
@@ -495,7 +517,7 @@ func (m *Manager) reconnectSSH(sess *SSHSession) error {
 		oldClient.Close()
 	}
 
-	client, err := agssh.Connect(sess.User, sess.Host, sess.Port, agssh.AuthConfig{
+	client, err := sshclient.Connect(sess.User, sess.Host, sess.Port, sshclient.AuthConfig{
 		Password: sess.GetPassword(),
 		KeyPath:  sess.GetKeyPath(),
 	})
@@ -509,10 +531,8 @@ func (m *Manager) reconnectSSH(sess *SSHSession) error {
 	sess.Status = StatusConnected
 	sess.mu.Unlock()
 
-	m.mu.Lock()
-	m.defaultName = sess.Name
-	m.mu.Unlock()
-
+	// Note: the default session is set by the caller (Use). Reconnect used
+	// during state restore must not steal the default.
 	return nil
 }
 

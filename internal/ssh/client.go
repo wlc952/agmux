@@ -100,7 +100,7 @@ func (c *Client) IsAlive() bool {
 
 	aliveCh := make(chan bool, 1)
 	go func() {
-		_, _, err := client.SendRequest("keepalive@agmux", true, nil)
+		_, _, err := client.SendRequest("keepalive@gssh", true, nil)
 		c.mu.Lock()
 		c.probing = false
 		c.mu.Unlock()
@@ -184,11 +184,11 @@ func getHostKeyCallback() (ssh.HostKeyCallback, error) {
 
 		// Unknown key (len(Want) == 0): Trust-On-First-Use — auto-accept
 		if len(keyErr.Want) == 0 {
-			autoTrust := strings.EqualFold(os.Getenv("AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS"), "1") ||
-				strings.EqualFold(os.Getenv("AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS"), "true")
+			autoTrust := strings.EqualFold(os.Getenv("GSSH_INSECURE_ACCEPT_NEW_HOST_KEYS"), "1") ||
+				strings.EqualFold(os.Getenv("GSSH_INSECURE_ACCEPT_NEW_HOST_KEYS"), "true")
 			if !autoTrust {
 				return fmt.Errorf(
-					"unknown host key for %s (%s), refusing auto-trust; add it to %s or set AGMUX_INSECURE_ACCEPT_NEW_HOST_KEYS=1",
+					"unknown host key for %s (%s), refusing auto-trust; add it to %s or set GSSH_INSECURE_ACCEPT_NEW_HOST_KEYS=1",
 					hostname,
 					ssh.FingerprintSHA256(key),
 					knownHostsPath,

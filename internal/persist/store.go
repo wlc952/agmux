@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"agmux/internal/session"
+	"gssh/internal/session"
 )
 
 // Store persists session metadata to disk for daemon restart recovery.
@@ -26,10 +26,10 @@ type SessionState struct {
 	CreatedAt int64  `json:"created_at"` // Unix timestamp
 }
 
-// NewStore creates a persistence store at ~/.agmux/state.json.
+// NewStore creates a persistence store at ~/.gssh/state.json.
 func NewStore() *Store {
 	homeDir, _ := os.UserHomeDir()
-	dir := filepath.Join(homeDir, ".agmux")
+	dir := filepath.Join(homeDir, ".gssh")
 	os.MkdirAll(dir, 0700)
 	return &Store{path: filepath.Join(dir, "state.json")}
 }

@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	Version = 1
-	HeaderSize = 7 // 1 (version) + 2 (type) + 4 (length)
+	Version        = 1
+	HeaderSize     = 7               // 1 (version) + 2 (type) + 4 (length)
 	MaxPayloadSize = 4 * 1024 * 1024 // 4 MB max payload
 )
 

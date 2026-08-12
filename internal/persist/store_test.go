@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"agmux/internal/session"
+	"gssh/internal/session"
 )
 
 func TestSessionToStateSSHIncludesReconnectMetadata(t *testing.T) {

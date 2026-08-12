@@ -9,14 +9,14 @@ import (
 // Default returns a per-user socket path.
 func Default() string {
 	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
-		return filepath.Join(runtimeDir, "agmux", "agmux.sock")
+		return filepath.Join(runtimeDir, "gssh", "gssh.sock")
 	}
 
 	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
-		return filepath.Join(homeDir, ".agmux", "run", "agmux.sock")
+		return filepath.Join(homeDir, ".gssh", "run", "gssh.sock")
 	}
 
-	return filepath.Join(os.TempDir(), fmt.Sprintf("agmux-%d.sock", os.Getuid()))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("gssh-%d.sock", os.Getuid()))
 }
 
 // EnsureParentDir ensures the socket parent directory exists.
