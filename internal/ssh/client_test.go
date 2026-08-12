@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -36,5 +37,40 @@ func TestKeyboardInteractive(t *testing.T) {
 		if a != "testpass" {
 			t.Errorf("answer = %s, want testpass", a)
 		}
+	}
+}
+
+func TestConnectWithoutAnyAuthMaterialFailsFast(t *testing.T) {
+	// Isolate from real ~/.ssh keys and any running ssh-agent.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	_, err := Connect("user", "127.0.0.1", 22, AuthConfig{})
+	if err == nil {
+		t.Fatal("expected error when no auth material is available")
+	}
+	if got := err.Error(); !strings.HasPrefix(got, "no authentication method available") {
+		t.Fatalf("expected 'no authentication method available' error, got: %v", err)
+	}
+}
+
+func TestDefaultKeyAuthMethodsSkipsMissingAndBadKeys(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if got := defaultKeyAuthMethods(); len(got) != 0 {
+		t.Fatalf("expected no methods with empty ~/.ssh, got %d", len(got))
+	}
+
+	sshDir := home + "/.ssh"
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// An unparseable key file must be skipped, not fatal.
+	if err := os.WriteFile(sshDir+"/id_ed25519", []byte("not a key"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := defaultKeyAuthMethods(); len(got) != 0 {
+		t.Fatalf("expected unparseable key to be skipped, got %d methods", len(got))
 	}
 }

@@ -49,6 +49,9 @@ type SSHSession struct {
 	CreatedAt time.Time
 	LastCmd   string
 	mu        sync.RWMutex
+	// reconnMu serializes dial-and-adopt cycles (initial connect excluded)
+	// so concurrent reconnect attempts cannot double-dial and leak a client.
+	reconnMu sync.Mutex
 }
 
 func (s *SSHSession) GetName() string         { return s.Name }
@@ -140,6 +143,29 @@ func (s *SSHSession) SetClient(client *sshclient.Client) {
 	s.Client = client
 }
 
+// AwaitClient blocks until the session is connected and returns its SSH
+// client. Terminal states (offline/disconnected) return an error immediately;
+// in-flight states (connecting/reconnecting) are awaited up to timeout.
+// Callers such as exec use this so a command fired while a connect or
+// reconnect is still dialing waits for the outcome instead of failing.
+func (s *SSHSession) AwaitClient(timeout time.Duration) (*ssh.Client, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		switch s.GetStatus() {
+		case StatusConnected:
+			if c := s.GetSSHClient(); c != nil {
+				return c, nil
+			}
+		case StatusOffline, StatusDisconnected:
+			return nil, fmt.Errorf("session %q is not connected (status: %s)", s.Name, s.GetStatus())
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("timed out waiting for session %q to connect", s.Name)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // LocalSession represents a local execution session.
 type LocalSession struct {
 	Name      string
@@ -196,14 +222,26 @@ type Manager struct {
 	sessions    map[string]Session // keyed by Name
 	defaultName string             // default session name
 	mu          sync.RWMutex
+	// connect dials SSH connections; replaceable in tests via SetConnectFunc.
+	connect func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error)
 }
 
 // NewManager creates a new session manager.
 func NewManager() *Manager {
 	return &Manager{
 		sessions: make(map[string]Session),
+		connect:  sshclient.Connect,
 	}
 }
+
+// SetConnectFunc overrides the SSH dial function. Intended for tests.
+func (m *Manager) SetConnectFunc(f func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error)) {
+	m.connect = f
+}
+
+// awaitTimeout bounds how long AwaitClient waits for an in-flight dial.
+// The SSH dial timeout is 10s, so 20s gives ample headroom.
+const awaitTimeout = 20 * time.Second
 
 // ConnectSSH creates a new SSH session or returns an existing one.
 func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPath string) (*SSHSession, error) {
@@ -219,43 +257,37 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 		if sshSess, ok := existing.(*SSHSession); ok &&
 			sshSess.Host == host && sshSess.User == user && sshSess.Port == port {
 			status := sshSess.GetStatus()
-			if status == StatusConnected || status == StatusConnecting {
+			switch status {
+			case StatusConnected:
 				m.defaultName = name
 				m.mu.Unlock()
 				return sshSess, nil
+
+			case StatusConnecting, StatusReconnecting:
+				// A connect/reconnect dial is already in flight (e.g. a
+				// concurrent shorthand exec or the reconnect monitor).
+				// Wait for its outcome instead of double-dialing.
+				m.defaultName = name
+				m.mu.Unlock()
+				if _, err := sshSess.AwaitClient(awaitTimeout); err != nil {
+					return nil, err
+				}
+				return sshSess, nil
 			}
 
-			// Existing session is offline/reconnecting — try to reconnect
-			sshSess.SetStatus(StatusConnecting)
+			// Existing session is offline — reconnect it. Caller's
+			// credentials win; otherwise keep the stored ones.
 			m.defaultName = name
 			m.mu.Unlock()
-
-			client, err := sshclient.Connect(user, host, port, sshclient.AuthConfig{Password: password, KeyPath: keyPath})
-			if err != nil {
-				sshSess.SetStatus(StatusOffline)
+			if password != "" {
+				sshSess.SetPassword(password)
+			}
+			if keyPath != "" {
+				sshSess.SetKeyPath(keyPath)
+			}
+			if err := m.reconnectSSH(sshSess); err != nil {
 				return nil, err
 			}
-
-			m.mu.RLock()
-			current, stillRegistered := m.sessions[name]
-			m.mu.RUnlock()
-			if !stillRegistered || current != sshSess {
-				client.Close()
-				return nil, fmt.Errorf("session was removed while reconnecting")
-			}
-
-			sshSess.mu.Lock()
-			if sshSess.Status != StatusConnecting {
-				sshSess.mu.Unlock()
-				client.Close()
-				return nil, fmt.Errorf("session state changed while reconnecting")
-			}
-			sshSess.Client = client
-			sshSess.Status = StatusConnected
-			sshSess.Password = password
-			sshSess.KeyPath = keyPath
-			sshSess.mu.Unlock()
-
 			return sshSess, nil
 		}
 		// Name collision with different host — reject
@@ -280,8 +312,10 @@ func (m *Manager) ConnectSSH(name, user, host string, port int, password, keyPat
 	m.mu.Unlock()
 
 	// Connect outside of Manager lock
-	client, err := sshclient.Connect(user, host, port, sshclient.AuthConfig{Password: password, KeyPath: keyPath})
+	client, err := m.connect(user, host, port, sshclient.AuthConfig{Password: password, KeyPath: keyPath})
 	if err != nil {
+		// Wake AwaitClient waiters before removing the session.
+		sess.SetStatus(StatusOffline)
 		m.mu.Lock()
 		delete(m.sessions, name)
 		if m.defaultName == name {
@@ -506,6 +540,12 @@ func (m *Manager) Reconnect(name string) (*SSHSession, error) {
 // --- Internal helpers ---
 
 func (m *Manager) reconnectSSH(sess *SSHSession) error {
+	// Serialize reconnect attempts: without this, two concurrent paths
+	// (restore goroutine, monitor, use, connect-dedup) could both dial and
+	// the loser's client would be overwritten and leaked.
+	sess.reconnMu.Lock()
+	defer sess.reconnMu.Unlock()
+
 	sess.SetStatus(StatusReconnecting)
 
 	// Close existing connection if any
@@ -517,7 +557,7 @@ func (m *Manager) reconnectSSH(sess *SSHSession) error {
 		oldClient.Close()
 	}
 
-	client, err := sshclient.Connect(sess.User, sess.Host, sess.Port, sshclient.AuthConfig{
+	client, err := m.connect(sess.User, sess.Host, sess.Port, sshclient.AuthConfig{
 		Password: sess.GetPassword(),
 		KeyPath:  sess.GetKeyPath(),
 	})
@@ -526,7 +566,23 @@ func (m *Manager) reconnectSSH(sess *SSHSession) error {
 		return err
 	}
 
+	// The dial happened outside any lock; re-validate before adopting the
+	// client — a kill landing mid-dial must not leave a live connection
+	// attached to a removed session.
+	m.mu.RLock()
+	current, stillRegistered := m.sessions[sess.Name]
+	m.mu.RUnlock()
+	if !stillRegistered || current != sess {
+		client.Close()
+		return fmt.Errorf("session was removed while reconnecting")
+	}
+
 	sess.mu.Lock()
+	if sess.Status != StatusReconnecting {
+		sess.mu.Unlock()
+		client.Close()
+		return fmt.Errorf("session state changed while reconnecting")
+	}
 	sess.Client = client
 	sess.Status = StatusConnected
 	sess.mu.Unlock()

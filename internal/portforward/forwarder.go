@@ -347,6 +347,10 @@ func NewService(sessions *session.Manager) *Service {
 	}
 }
 
+// sessionReadyTimeout bounds how long Add waits for an in-flight
+// connect/reconnect dial before giving up.
+const sessionReadyTimeout = 20 * time.Second
+
 // Add creates a new port forward for the given session.
 func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int, bindAddr string) (*ForwardInfo, error) {
 	sess, err := s.sessions.Get(sessionName)
@@ -359,9 +363,9 @@ func (s *Service) Add(sessionName, forwardType string, localPort, remotePort int
 	}
 
 	sshSess := sess.(*session.SSHSession)
-	sshClient := sshSess.GetSSHClient()
-	if sshClient == nil {
-		return nil, fmt.Errorf("session not connected")
+	sshClient, err := sshSess.AwaitClient(sessionReadyTimeout)
+	if err != nil {
+		return nil, err
 	}
 
 	forwarder, err := NewForwarder(sshClient, forwardType, localPort, remotePort, bindAddr)

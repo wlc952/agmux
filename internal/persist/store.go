@@ -24,6 +24,11 @@ type SessionState struct {
 	KeyPath   string `json:"key_path,omitempty"`
 	Status    string `json:"status"`
 	CreatedAt int64  `json:"created_at"` // Unix timestamp
+	// AutoReconnect is true when the session can be re-established after a
+	// daemon restart without user-supplied credentials: an explicit key path,
+	// or default key material (ssh-agent / ~/.ssh default keys). Password-only
+	// sessions are excluded because passwords are never persisted.
+	AutoReconnect bool `json:"auto_reconnect,omitempty"`
 }
 
 // NewStore creates a persistence store at ~/.gssh/state.json.
@@ -75,6 +80,8 @@ func SessionToState(sess session.Session) SessionState {
 		sshSess := sess.(*session.SSHSession)
 		state.Port = sshSess.Port
 		state.KeyPath = sshSess.GetKeyPath()
+		// Auto-reconnect is possible for anything but password-only auth.
+		state.AutoReconnect = sshSess.GetKeyPath() != "" || sshSess.GetPassword() == ""
 	}
 
 	return state

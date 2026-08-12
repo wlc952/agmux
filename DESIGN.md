@@ -52,10 +52,11 @@ Daemon lifecycle:
 gssh/
 ├── cmd/
 │   └── gssh/
-│       ├── main.go               # Entry point, command dispatch, usage
+│       ├── main.go               # Entry point, dispatch (incl. user@host shorthand), usage
 │       ├── client.go             # RPC client: dial, auto-start, streaming
 │       ├── server.go             # `gssh server` subcommand (daemon)
 │       ├── commands.go           # Subcommand flag parsing + handlers
+│       ├── dest.go               # ssh-style destination/scp-endpoint/forward-spec parsing
 │       ├── spawn_unix.go         # setsid detach (//go:build unix)
 │       ├── spawn_other.go        # no-op detach (//go:build !unix)
 │       ├── peercred_darwin.go    # Peer credential check (LOCAL_PEERCRED)
@@ -72,7 +73,7 @@ gssh/
 │   │   ├── session.go            # Session iface, SSHSession, LocalSession, Manager
 │   │   └── session_test.go
 │   ├── ssh/
-│   │   ├── client.go             # Dial, auth, known_hosts policy, IsAlive
+│   │   ├── client.go             # Dial, auth (pswd/-i/agent/default keys), known_hosts
 │   │   └── client_test.go
 │   ├── exec/
 │   │   ├── executor.go           # remote/local × buffered/stream × sudo matrix
@@ -85,6 +86,8 @@ gssh/
 │   │   └── forwarder_test.go
 │   ├── transfer/
 │   │   ├── sftp.go               # SFTP upload/download/dir ops
+│   │   ├── safefile_unix.go      # TOCTOU-safe download writes (fd-anchored O_NOFOLLOW)
+│   │   ├── safefile_other.go     # Portable fallback (path-traversal checks only)
 │   │   └── sftp_test.go
 │   ├── reconnect/
 │   │   ├── monitor.go            # Health check + exponential backoff
@@ -223,10 +226,12 @@ func (s *Server) Stop() error    // Idempotent graceful shutdown
 
 - Load `~/.gssh/state.json`.
 - Local sessions: re-created immediately.
-- SSH sessions: registered as `offline`. If a key path was persisted, a
-  background goroutine reconnects via `Manager.Reconnect` and starts the
-  reconnect monitor. Password sessions stay offline (passwords are never
-  persisted) until the agent runs `gssh use <name> -p password`.
+- SSH sessions: registered as `offline`. Unless the session used password-only
+  auth (`auto_reconnect` in state), a background goroutine reconnects via
+  `Manager.Reconnect` — explicit key path if present, otherwise the default
+  key material (agent / default key files) — and starts the reconnect monitor.
+  Password-only sessions stay offline (passwords are never persisted) until
+  the agent runs `gssh use <name> --pswd password`.
 - `Reconnect` deliberately does not steal the default session.
 
 ## 5. Session Model
@@ -266,6 +271,19 @@ behaviors:
   session; same name with a different host is rejected.
 - New SSH connections dial **outside** the manager lock; state is re-validated
   after the dial to avoid racing kill/use.
+- Concurrency invariants (do not break these):
+  - A dedup hit on a `connecting`/`reconnecting` session **waits** via
+    `SSHSession.AwaitClient` instead of returning a client-less session or
+    double-dialing.
+  - All reconnect paths (`Use`, restore, monitor, offline `ConnectSSH`)
+    funnel through `Manager.reconnectSSH`, which holds the per-session
+    `reconnMu` for the whole dial-and-adopt cycle and re-checks registration
+    + status after the dial. A kill landing mid-dial closes the new client
+    instead of leaking it.
+  - Callers that need the SSH client (exec, transfer, portforward) use
+    `AwaitClient`, so a command fired while a (re)connect is in flight waits
+    for the outcome rather than failing with "session not connected".
+  - The dial func is injectable (`Manager.SetConnectFunc`) for tests.
 - `Use(name, password, keyPath)` sets the default and, for offline SSH
   sessions, updates credentials and reconnects.
 - `Reconnect(name)` reconnects without touching the default (state restore).
@@ -315,8 +333,13 @@ and the `Service` (registry keyed by full UUID).
 
 SFTP (`github.com/pkg/sftp`) over the session's SSH connection; SSH sessions
 only. Upload/download recurse into directories; `sync` semantics skip files
-with identical size+mtime. Downloads are guarded against path traversal with
-`filepath.IsLocal()`.
+with identical size+mtime.
+
+Download-side hardening is split by platform (`safefile_unix.go` /
+`safefile_other.go` behind a `safeRoot` type): on unix, all writes are
+fd-anchored to the destination root with `O_NOFOLLOW` traversal (immune to
+symlink-swap races); elsewhere, plain path-based writes with the same
+`..` traversal rejection. Both reject paths escaping the destination root.
 
 ## 9. Reconnect Monitor
 
@@ -324,8 +347,9 @@ with identical size+mtime. Downloads are guarded against path traversal with
 
 - Watches each connected SSH session; health check every 5s via
   `keepalive@gssh` SSH request with a 5s timeout.
-- On failure: status → `reconnecting`, redial with stored credentials.
-  Backoff: 5s → 10s → 20s → ... → max 5min, reset on success.
+- On failure: delegates to `Manager.Reconnect` (serialized via `reconnMu`,
+  redials with stored credentials). Backoff: 5s → 10s → 20s → ... → max 5min,
+  reset on success.
 - On success: status → `connected`, then `forwards.RestartAll`.
 - `kill` stops the watch; `use` on an offline session re-arms it.
 
@@ -335,14 +359,15 @@ with identical size+mtime. Downloads are guarded against path traversal with
 
 ```go
 type SessionState struct {
-    Name      string `json:"name"`
-    Type      string `json:"type"` // "ssh" or "local"
-    Host      string `json:"host"`
-    User      string `json:"user"`
-    Port      int    `json:"port,omitempty"`
-    KeyPath   string `json:"key_path,omitempty"`
-    Status    string `json:"status"`
-    CreatedAt int64  `json:"created_at"`
+    Name          string `json:"name"`
+    Type          string `json:"type"` // "ssh" or "local"
+    Host          string `json:"host"`
+    User          string `json:"user"`
+    Port          int    `json:"port,omitempty"`
+    KeyPath       string `json:"key_path,omitempty"`
+    Status        string `json:"status"`
+    CreatedAt     int64  `json:"created_at"`
+    AutoReconnect bool   `json:"auto_reconnect,omitempty"` // false only for password-only auth
     // Password deliberately NOT persisted
 }
 ```
@@ -367,27 +392,71 @@ or `exit_<code>` for exec.
 7. **Host keys**: `known_hosts` enforced; unknown keys rejected unless
    `GSSH_INSECURE_ACCEPT_NEW_HOST_KEYS=1` (TOFU opt-in); mismatches always rejected.
 
-## 13. CLI Commands
+## 13. CLI Design (ssh-aligned)
+
+The CLI mirrors ssh/scp muscle memory. The `connect` subcommand is optional:
+any first argument containing `@` is treated as a destination.
 
 ```
-gssh connect -u user -h host [-P port] [-n name] [-p password] [-i key]
+gssh user@host [-p port] [-i key] [--pswd pw] [-n name]     # connect (session created)
+gssh user@host [flags] command...                           # connect-if-needed + exec
+gssh connect user@host [-p port] [-i key] [--pswd pw]       # explicit form
+
 gssh local [-n name]
-gssh kill [-n name]
-gssh exec [-n name] [-t timeout] [--stream] [--json] [--sudo ...] "command"
-gssh run [-t timeout] [--stream] [--json] [--sudo ...] "command"
+gssh exec [-n name] [-t timeout] [--stream] [--raw] [--sudo ...] "command"
+gssh run [-t timeout] [--stream] [--raw] [--sudo ...] "command"
 gssh list | ls [--json]
-gssh use <name> [-p password] [-i key]
-gssh forward [-n name] -l local -r remote [-R] [--bind addr|--public]
+gssh use <name> [--pswd pw] [-i key]
+gssh kill [-n name]
+gssh forward [-n name] -L localPort:remotePort              # ssh -L semantics
+gssh forward [-n name] -R remotePort:localPort [--bind addr|--public]
 gssh forwards [--json]
 gssh forward-close <id-or-prefix>
-gssh scp|sync [-n name] -put|-get <src> <dst>
-gssh sftp [-n name] -c ls|mkdir|rm -p <path>
+gssh scp|sync <src> <dst>                                   # one side is session:path
+gssh sftp [-n name] ls|mkdir|rm <path>
 gssh ping
 gssh start | stop
-gssh server                                  # daemon in foreground (internal)
+gssh server                                                 # daemon in foreground (internal)
 gssh -v, --version
-gssh -S <socket_path>                        # global, before the subcommand
+gssh -S <socket_path> ...                                   # global, before the subcommand
 ```
+
+Shorthand exec (`gssh user@host "cmd"`) is client-side composition: MsgConnect
+(dedup fast-path reuses a live session) followed by MsgExec/MsgExecStream —
+no new protocol surface.
+
+Output modes (agent-first): non-streaming exec prints a single JSON object
+`{"stdout","stderr","exit_code"}` to stdout by default and the CLI process
+exits with the command's exit code, so shell `&&`-chains keep working.
+`--raw` switches to raw stdout/stderr passthrough for humans and pipes.
+`--json` is accepted as a no-op for compatibility with pre-default-JSON
+scripts. `--stream` bypasses result framing entirely (chunk frames).
+
+Parsing notes:
+
+- Destination: split at the **last** `@`; a missing user defaults to the
+  current OS user (like ssh). The shorthand gate requires `@` so session
+  names can never collide with destinations.
+- scp endpoints: `session:path` — prefixes containing `/` or `\`, single
+  letters (drive letters), and empty prefixes are always local. Empty path
+  after the colon means the remote home (`.`).
+- Forward specs follow ssh ordering: `-L local:remote`, `-R remote:local`.
+- Go's flag package stops at the first positional, so flags must precede the
+  remote command (same as ssh).
+
+### Auth order (internal/ssh)
+
+1. Explicit `--pswd` — password + keyboard-interactive, tried **first** so
+   offering many agent keys cannot trip the server's MaxAuthTries limit.
+2. Explicit `-i` key. Passphrase-protected keys produce a clear error
+   pointing at ssh-agent (no interactive prompt by design).
+3. With no explicit key: ssh-agent (`SSH_AUTH_SOCK`), then the default key
+   files `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`, `id_dsa` (unreadable or
+   passphrase-protected ones are skipped).
+
+The agent connection is used only for the auth handshake and closed right
+after `ssh.Dial` returns, so the long-lived daemon does not leak fds across
+reconnects.
 
 Client RPC deadlines: 10s default; 30s for connect/use (SSH dial budget);
 `-t N` exec extends the deadline to N + 30s; unlimited `--stream` has no deadline.

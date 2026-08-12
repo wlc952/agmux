@@ -32,6 +32,10 @@ func NewExecutor(sessions *session.Manager) *Executor {
 	return &Executor{sessions: sessions}
 }
 
+// sessionReadyTimeout bounds how long exec waits for an in-flight
+// connect/reconnect dial before giving up.
+const sessionReadyTimeout = 20 * time.Second
+
 // Exec executes a command in the specified session context.
 func (e *Executor) Exec(sessionName, command string, timeout int, sudoOpts *protocol.SudoOptions) (*protocol.ExecResult, error) {
 	sess, err := e.sessions.Get(sessionName)
@@ -46,9 +50,9 @@ func (e *Executor) Exec(sessionName, command string, timeout int, sudoOpts *prot
 	}
 
 	sshSess := sess.(*session.SSHSession)
-	sshClient := sshSess.GetSSHClient()
-	if sshClient == nil {
-		return nil, fmt.Errorf("session not connected")
+	sshClient, err := sshSess.AwaitClient(sessionReadyTimeout)
+	if err != nil {
+		return nil, err
 	}
 
 	return runRemote(sshClient, command, timeout, sudoOpts)
@@ -81,9 +85,9 @@ func (e *Executor) ExecStream(sessionName, command string, timeout int, sudoOpts
 	}
 
 	sshSess := sess.(*session.SSHSession)
-	sshClient := sshSess.GetSSHClient()
-	if sshClient == nil {
-		return 1, fmt.Errorf("session not connected")
+	sshClient, err := sshSess.AwaitClient(sessionReadyTimeout)
+	if err != nil {
+		return 1, err
 	}
 
 	return runRemoteStream(sshClient, command, timeout, sudoOpts, stdoutW, stderrW)

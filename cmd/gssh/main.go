@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gssh/internal/socketpath"
 )
@@ -90,6 +91,11 @@ func main() {
 	case "help":
 		printUsage()
 	default:
+		// ssh-style shorthand: `gssh user@host [flags] [command...]`
+		if strings.Contains(cmd, "@") {
+			err = handleDestination(cmd, subArgs)
+			break
+		}
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", cmd)
 		printUsage()
 		os.Exit(1)
@@ -104,54 +110,61 @@ func main() {
 func printUsage() {
 	fmt.Printf(`gssh - SSH session multiplexer for agents v%s
 
-Usage:
-  gssh start                                     Start daemon (auto-started on demand)
-  gssh connect -u user -h host [-n name] [-P port] [-p password] [-i key]
+Usage (ssh-style):
+  gssh user@host [-p port] [-i key] [--pswd pw] [-n name]      Connect (creates session)
+  gssh user@host [-p port] [flags] "command"                   Connect if needed, then exec
+  gssh connect user@host [-p port] [-i key] [--pswd pw]        Same, explicit subcommand
+
+  Auth: with no flags, tries ssh-agent then ~/.ssh default keys
+  (id_ed25519, id_ecdsa, id_rsa) — just like ssh. Use --pswd for password.
+
+Session commands:
   gssh local [-n name]                           Create local session
-  gssh kill [-n name]                            Kill session
-  gssh exec [-n name] [-t timeout] [--stream] [--json] [--sudo ...] "command"
-  gssh run [-t timeout] [--stream] [--json] [--sudo ...] "command"  One-off local exec
+  gssh exec [-n name] [-t timeout] [--stream] [--raw] [--sudo ...] "command"
+  gssh run [-t timeout] [--stream] [--raw] [--sudo ...] "command"  One-off local exec
   gssh list | ls [--json]                        List sessions
-  gssh use <name> [-p password] [-i key]         Switch default / reconnect session
-  gssh forward [-n name] -l local -r remote [-R] [--bind addr|--public]
+  gssh use <name> [--pswd pw] [-i key]           Switch default / reconnect session
+  gssh kill [-n name]                            Kill session
+
+Transfers & forwards (scp/ssh-style):
+  gssh scp <src> <dst>                           One side is session:path (upload or download)
+  gssh sync <src> <dst>                          Alias of scp (transfers skip unchanged files)
+  gssh sftp [-n name] ls|mkdir|rm <path>
+  gssh forward [-n name] -L localPort:remotePort
+  gssh forward [-n name] -R remotePort:localPort [--bind addr|--public]
   gssh forwards [--json]                         List forwards
   gssh forward-close <id>                        Close forward (ID or unique prefix)
-  gssh scp [-n name] -put|-get <src> <dst>
-  gssh sync [-n name] -put|-get <src> <dst>
-  gssh sftp [-n name] -c ls|mkdir|rm -p <path>
-  gssh ping                                      Check daemon
-  gssh stop                                      Stop daemon
+
+Daemon:
+  gssh start | stop | ping                       Daemon starts automatically when needed
   gssh server                                    Run daemon in foreground (internal)
   gssh -v, --version
+  gssh -S <socket_path> ...                      Override socket (default: %s)
 
-Options:
-  -S socket_path    Unix socket path (default: %s)
-  -n name           Session name
-  -u user           Username
-  -h host           Host address
-  -P port           SSH port (default: 22)
-  -p password       SSH password (for sftp: remote path)
-  -i key_path       SSH key path
+Exec options:
   -t timeout        Command timeout in seconds
-  --sudo            Run with sudo
-  --sudo-password   Sudo password
+  --stream          Stream stdout/stderr in real-time (for long-running commands)
+  --raw             Raw stdout/stderr instead of the default JSON result
+  --sudo            Run with sudo (password via stdin, no shell injection)
+  --pswd            Sudo password (on connect: SSH password; doubles as sudo
+                    password in the user@host shorthand when --sudo is set)
   --sudo-user       Run as specified user
   --sudo-login      Login shell (-i)
-  --stream          Stream stdout/stderr in real-time (for long-running commands)
-  --json            Machine-readable JSON output
-  --bind addr       Remote bind address for -R (default: 127.0.0.1)
-  --public          Shortcut for --bind 0.0.0.0
+
+Non-stream exec prints {"stdout","stderr","exit_code"} JSON by default and
+exits with the command's exit code, so shell &&-chains still work.
 
 The daemon starts automatically when any command needs it; "gssh start" is
 only needed to control startup explicitly. Daemon logs go to ~/.gssh/server.log.
 
 Examples:
-  gssh connect -u admin -h 10.0.1.1 -n production -p password
-  gssh exec -n production "ls -la"
-  gssh exec --json -t 10 "make build"
-  gssh exec --sudo --sudo-password 1234 "ls /root/"
-  gssh run "ls -la /tmp"
-  gssh use production -p password
-  gssh forward -n production -l 8080 -r 80
+  gssh admin@10.0.1.1                            Connect with default key / agent
+  gssh admin@10.0.1.1 -p 7080 --pswd secret      Connect with port + password
+  gssh admin@10.0.1.1 "df -h"                    One-off exec (reuses session, JSON out)
+  gssh admin@10.0.1.1 --raw "tail -20 app.log"   Raw output for humans/pipes
+  gssh exec -n production -t 30 "make build"
+  gssh scp ./app.zip production:/opt/
+  gssh scp production:/var/log/app.log ./logs/
+  gssh forward -n production -L 8080:80
 `, version, socketpath.Default())
 }

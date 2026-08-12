@@ -115,6 +115,10 @@ func (s *Service) Remove(sessionName, path string) error {
 	return sess.Remove(path)
 }
 
+// sessionReadyTimeout bounds how long a transfer waits for an in-flight
+// connect/reconnect dial before giving up.
+const sessionReadyTimeout = 20 * time.Second
+
 // --- SFTP Client wrapper ---
 
 type sftpSession struct {
@@ -132,9 +136,9 @@ func (s *Service) getSFTPSession(sessionName string) (*sftpSession, error) {
 	}
 
 	sshSess := sess.(*session.SSHSession)
-	sshClient := sshSess.GetSSHClient()
-	if sshClient == nil {
-		return nil, fmt.Errorf("session not connected")
+	sshClient, err := sshSess.AwaitClient(sessionReadyTimeout)
+	if err != nil {
+		return nil, err
 	}
 
 	sftpClient, err := sftp.NewClient(sshClient)
@@ -156,7 +160,11 @@ func (s *sftpSession) Upload(localPath, remotePath string) (int64, error) {
 	}
 
 	if !localInfo.IsDir() {
-		return s.uploadFile(localPath, remotePath)
+		target, err := s.resolveUploadFileTarget(localPath, remotePath)
+		if err != nil {
+			return 0, err
+		}
+		return s.uploadFile(localPath, target)
 	}
 
 	var totalWritten int64
@@ -199,6 +207,43 @@ func (s *sftpSession) Upload(localPath, remotePath string) (int64, error) {
 	return totalWritten, err
 }
 
+// resolveUploadFileTarget maps scp-style directory destinations to the full
+// remote file path: "." (session home), a trailing slash, or an existing
+// remote directory all mean "inside that directory, same basename".
+// SFTP paths always use forward slashes.
+func (s *sftpSession) resolveUploadFileTarget(localPath, remotePath string) (string, error) {
+	base := filepath.ToSlash(filepath.Base(localPath))
+	if remotePath == "" || remotePath == "." {
+		return base, nil
+	}
+	if strings.HasSuffix(remotePath, "/") {
+		remotePath = strings.TrimSuffix(remotePath, "/")
+		info, err := s.client.Stat(remotePath)
+		if err != nil || !info.IsDir() {
+			return "", fmt.Errorf("remote destination %s is not a directory", remotePath)
+		}
+		return remotePath + "/" + base, nil
+	}
+	if info, err := s.client.Stat(remotePath); err == nil && info.IsDir() {
+		return remotePath + "/" + base, nil
+	}
+	return remotePath, nil
+}
+
+// resolveDownloadFileTarget maps scp-style directory destinations to the
+// full local file path: a trailing slash or an existing local directory
+// means "inside that directory, same basename".
+func resolveDownloadFileTarget(localPath, remotePath string) string {
+	base := filepath.Base(strings.TrimSuffix(remotePath, "/"))
+	if strings.HasSuffix(localPath, "/") || strings.HasSuffix(localPath, string(os.PathSeparator)) {
+		return filepath.Join(localPath, base)
+	}
+	if info, err := os.Stat(localPath); err == nil && info.IsDir() {
+		return filepath.Join(localPath, base)
+	}
+	return localPath
+}
+
 func (s *sftpSession) uploadFile(localPath, remotePath string) (int64, error) {
 	localFile, err := os.Open(localPath)
 	if err != nil {
@@ -239,6 +284,7 @@ func (s *sftpSession) Download(remotePath, localPath string) (int64, error) {
 	}
 
 	if !remoteInfo.IsDir() {
+		localPath = resolveDownloadFileTarget(localPath, remotePath)
 		targetPath, rootAbs, rootResolved, err := prepareSingleFileDownloadTarget(localPath)
 		if err != nil {
 			return 0, err

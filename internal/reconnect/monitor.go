@@ -7,7 +7,6 @@ import (
 
 	"gssh/internal/portforward"
 	"gssh/internal/session"
-	sshclient "gssh/internal/ssh"
 )
 
 // Monitor watches SSH sessions for disconnection and reconnects with exponential backoff.
@@ -16,7 +15,6 @@ type Monitor struct {
 	forwards *portforward.Service
 	watched  map[string]watchCtx
 	mu       sync.Mutex
-	connect  func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error)
 }
 
 type watchCtx struct {
@@ -37,7 +35,6 @@ func NewMonitor(sessions *session.Manager, forwards *portforward.Service) *Monit
 		sessions: sessions,
 		forwards: forwards,
 		watched:  make(map[string]watchCtx),
-		connect:  sshclient.Connect,
 	}
 }
 
@@ -100,34 +97,25 @@ func (m *Monitor) checkAndReconnect(sess *session.SSHSession, ctx *watchCtx) tim
 		return monitorInterval
 	}
 
-	log.Printf("[reconnect] Session %s appears dead, reconnecting", sess.GetName())
+	name := sess.GetName()
+	log.Printf("[reconnect] Session %s appears dead, reconnecting", name)
 
-	sess.SetStatus(session.StatusReconnecting)
-	if client != nil {
-		client.Close()
-		sess.SetClient(nil)
-	}
-
-	newClient, err := m.connect(sess.User, sess.Host, sess.Port, sshclient.AuthConfig{
-		Password: sess.GetPassword(),
-		KeyPath:  sess.GetKeyPath(),
-	})
-	if err != nil {
-		log.Printf("[reconnect] Failed to reconnect %s: %v (backoff: %v)", sess.GetName(), err, ctx.backoff)
-		sess.SetStatus(session.StatusOffline)
+	// Delegate to the manager's serialized reconnect path: it closes the old
+	// client, dials with stored credentials, and re-validates registration
+	// before adopting the new one.
+	if _, err := m.sessions.Reconnect(name); err != nil {
+		log.Printf("[reconnect] Failed to reconnect %s: %v (backoff: %v)", name, err, ctx.backoff)
 		delay := ctx.backoff
 		ctx.backoff = min(ctx.backoff*time.Duration(backoffFactor), maxBackoff)
 		return delay
 	}
 
-	sess.SetClient(newClient)
-	sess.SetStatus(session.StatusConnected)
 	ctx.backoff = initialBackoff
 
 	if m.forwards != nil {
-		m.forwards.RestartAll(sess.GetName(), newClient.GoClient)
+		m.forwards.RestartAll(name, sess.GetSSHClient())
 	}
 
-	log.Printf("[reconnect] Session %s reconnected successfully", sess.GetName())
+	log.Printf("[reconnect] Session %s reconnected successfully", name)
 	return monitorInterval
 }

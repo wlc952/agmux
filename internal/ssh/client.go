@@ -1,15 +1,18 @@
 package ssh
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
@@ -27,16 +30,17 @@ type AuthConfig struct {
 }
 
 // Connect establishes an SSH connection using the given auth config.
+//
+// Auth method order mirrors user intent:
+//  1. explicit password (AuthConfig.Password) — password + keyboard-interactive
+//  2. explicit key (AuthConfig.KeyPath)
+//  3. default key material when no explicit key: ssh-agent (SSH_AUTH_SOCK),
+//     then the standard ~/.ssh default key files
+//
+// Password goes first when explicitly provided: offering a dozen agent keys
+// before the password can trip the server's MaxAuthTries limit.
 func Connect(user, host string, port int, auth AuthConfig) (*Client, error) {
 	var authMethods []ssh.AuthMethod
-
-	if auth.KeyPath != "" {
-		methods, err := authFromKeyPath(auth.KeyPath)
-		if err != nil {
-			return nil, err
-		}
-		authMethods = append(authMethods, methods...)
-	}
 
 	if auth.Password != "" {
 		authMethods = append(authMethods, ssh.Password(auth.Password))
@@ -44,8 +48,29 @@ func Connect(user, host string, port int, auth AuthConfig) (*Client, error) {
 		authMethods = append(authMethods, ssh.KeyboardInteractive(handler.Challenge))
 	}
 
+	var agentConn net.Conn
+	if auth.KeyPath != "" {
+		methods, err := authFromKeyPath(auth.KeyPath)
+		if err != nil {
+			return nil, err
+		}
+		authMethods = append(authMethods, methods...)
+	} else {
+		if sock := os.Getenv("SSH_AUTH_SOCK"); sock != "" {
+			if conn, err := net.Dial("unix", sock); err == nil {
+				agentConn = conn
+				authMethods = append(authMethods, ssh.PublicKeysCallback(agent.NewClient(conn).Signers))
+			}
+		}
+		authMethods = append(authMethods, defaultKeyAuthMethods()...)
+	}
+	if agentConn != nil {
+		// The agent connection is only needed during the auth handshake.
+		defer agentConn.Close()
+	}
+
 	if len(authMethods) == 0 {
-		return nil, fmt.Errorf("no authentication method provided")
+		return nil, fmt.Errorf("no authentication method available: pass --pswd or -i, load a key into ssh-agent, or add a default key (~/.ssh/id_ed25519)")
 	}
 
 	hostKeyCallback, err := getHostKeyCallback()
@@ -60,7 +85,7 @@ func Connect(user, host string, port int, auth AuthConfig) (*Client, error) {
 		Timeout:         10 * time.Second,
 	}
 
-	addr := fmt.Sprintf("%s:%d", host, port)
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	goClient, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
@@ -137,9 +162,37 @@ func authFromKeyPath(keyPath string) ([]ssh.AuthMethod, error) {
 	}
 	signer, err := ssh.ParsePrivateKey(key)
 	if err != nil {
+		var passErr *ssh.PassphraseMissingError
+		if errors.As(err, &passErr) {
+			return nil, fmt.Errorf("key %s is passphrase-protected: load it into ssh-agent (ssh-add) first; passphrase prompt is not supported", keyPath)
+		}
 		return nil, fmt.Errorf("unable to parse private key: %w", err)
 	}
 	return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil
+}
+
+// defaultKeyAuthMethods loads the standard ~/.ssh default keys that exist
+// and are usable without a passphrase (same set ssh tries by default).
+// Passphrase-protected keys are skipped — they belong in ssh-agent.
+func defaultKeyAuthMethods() []ssh.AuthMethod {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+
+	var methods []ssh.AuthMethod
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa", "id_dsa"} {
+		key, err := os.ReadFile(filepath.Join(homeDir, ".ssh", name))
+		if err != nil {
+			continue
+		}
+		signer, err := ssh.ParsePrivateKey(key)
+		if err != nil {
+			continue
+		}
+		methods = append(methods, ssh.PublicKeys(signer))
+	}
+	return methods
 }
 
 // --- TOFU host key policy ---

@@ -10,20 +10,18 @@ import (
 )
 
 func TestCheckAndReconnectFailureReturnsBackoff(t *testing.T) {
-	mon := NewMonitor(session.NewManager(), nil)
-	mon.connect = func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error) {
+	mgr := session.NewManager()
+	mgr.SetConnectFunc(func(user, host string, port int, auth sshclient.AuthConfig) (*sshclient.Client, error) {
 		return nil, fmt.Errorf("dial failed")
-	}
+	})
+	mgr.RegisterOfflineSession("prod", "root", "example.com", 22, "", time.Now())
+	mon := NewMonitor(mgr, nil)
 
-	sess := &session.SSHSession{
-		Name:      "prod",
-		Host:      "example.com",
-		User:      "root",
-		Port:      22,
-		Password:  "secret",
-		Status:    session.StatusOffline,
-		CreatedAt: time.Now(),
+	sessIface, err := mgr.Get("prod")
+	if err != nil {
+		t.Fatalf("Get failed: %v", err)
 	}
+	sess := sessIface.(*session.SSHSession)
 	ctx := &watchCtx{cancel: make(chan struct{}), backoff: initialBackoff}
 
 	delay := mon.checkAndReconnect(sess, ctx)

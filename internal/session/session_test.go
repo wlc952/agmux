@@ -2,6 +2,10 @@ package session
 
 import (
 	"testing"
+	"time"
+
+	"golang.org/x/crypto/ssh"
+	sshclient "gssh/internal/ssh"
 )
 
 func TestNewManager(t *testing.T) {
@@ -118,5 +122,43 @@ func TestStatusConstants(t *testing.T) {
 	}
 	if StatusConnecting != "connecting" {
 		t.Errorf("StatusConnecting = %s", StatusConnecting)
+	}
+}
+
+func TestAwaitClientTerminalStatesFailFast(t *testing.T) {
+	sess := &SSHSession{Name: "s", Status: StatusOffline, CreatedAt: time.Now()}
+	if _, err := sess.AwaitClient(5 * time.Second); err == nil {
+		t.Fatal("expected immediate error for offline session")
+	}
+
+	sess.SetStatus(StatusDisconnected)
+	if _, err := sess.AwaitClient(5 * time.Second); err == nil {
+		t.Fatal("expected immediate error for disconnected session")
+	}
+}
+
+func TestAwaitClientTimesOutWhileConnecting(t *testing.T) {
+	sess := &SSHSession{Name: "s", Status: StatusConnecting, CreatedAt: time.Now()}
+	start := time.Now()
+	if _, err := sess.AwaitClient(150 * time.Millisecond); err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Fatalf("returned too early: %v", elapsed)
+	}
+}
+
+func TestAwaitClientReturnsWhenConnected(t *testing.T) {
+	sess := &SSHSession{Name: "s", Status: StatusConnecting, CreatedAt: time.Now()}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		sess.mu.Lock()
+		sess.Client = &sshclient.Client{GoClient: &ssh.Client{}}
+		sess.Status = StatusConnected
+		sess.mu.Unlock()
+	}()
+
+	if _, err := sess.AwaitClient(5 * time.Second); err != nil {
+		t.Fatalf("expected client, got %v", err)
 	}
 }

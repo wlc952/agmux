@@ -508,14 +508,16 @@ func (s *Server) restoreState() {
 		}
 
 		// SSH sessions: register as offline, then auto-reconnect in the
-		// background when key auth is available (passwords are never
-		// persisted, so password sessions must be restored manually via
-		// `gssh use <name> -p password`).
+		// background when non-interactive auth is available (explicit key,
+		// or default key material via agent/default key files). Password-only
+		// sessions stay offline (passwords are never persisted) until the
+		// agent runs `gssh use <name> --pswd password`.
 		s.sessions.RegisterOfflineSession(
 			state.Name, state.User, state.Host, state.Port,
 			state.KeyPath, time.Unix(state.CreatedAt, 0),
 		)
-		if state.KeyPath != "" {
+		// state.KeyPath check keeps pre-auto_reconnect state files working.
+		if state.AutoReconnect || state.KeyPath != "" {
 			go func(name string) {
 				sess, err := s.sessions.Reconnect(name)
 				if err != nil {

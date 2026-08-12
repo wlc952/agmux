@@ -89,3 +89,24 @@ func TestSafeRootOpenFileCreatesRegularFile(t *testing.T) {
 	}
 	defer f.Close()
 }
+
+func TestResolveDownloadFileTarget(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name       string
+		localPath  string
+		remotePath string
+		want       string
+	}{
+		{name: "plain file target unchanged", localPath: filepath.Join(dir, "out.log"), remotePath: "/var/log/app.log", want: filepath.Join(dir, "out.log")},
+		{name: "trailing slash joins basename", localPath: dir + "/", remotePath: "/var/log/app.log", want: filepath.Join(dir, "app.log")},
+		{name: "existing directory joins basename", localPath: dir, remotePath: "/var/log/app.log", want: filepath.Join(dir, "app.log")},
+	}
+
+	for _, tt := range tests {
+		if got := resolveDownloadFileTarget(tt.localPath, tt.remotePath); got != tt.want {
+			t.Errorf("%s: resolveDownloadFileTarget(%q, %q) = %q, want %q", tt.name, tt.localPath, tt.remotePath, got, tt.want)
+		}
+	}
+}

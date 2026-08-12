@@ -51,3 +51,31 @@ func TestSessionToStateLocalOmitsSSHMetadata(t *testing.T) {
 		t.Fatalf("KeyPath = %q, want empty", state.KeyPath)
 	}
 }
+
+func TestSessionToStateAutoReconnect(t *testing.T) {
+	tests := []struct {
+		name     string
+		password string
+		keyPath  string
+		want     bool
+	}{
+		{name: "password only cannot auto-reconnect", password: "secret", want: false},
+		{name: "explicit key can auto-reconnect", keyPath: "~/.ssh/id_ed25519", want: true},
+		{name: "key and password can auto-reconnect via key", password: "secret", keyPath: "~/.ssh/id_ed25519", want: true},
+		{name: "default key material can auto-reconnect", want: true},
+	}
+
+	for _, tt := range tests {
+		sess := &session.SSHSession{
+			Name:     "s",
+			Host:     "h",
+			User:     "u",
+			Status:   session.StatusConnected,
+			Password: tt.password,
+			KeyPath:  tt.keyPath,
+		}
+		if got := SessionToState(sess).AutoReconnect; got != tt.want {
+			t.Errorf("%s: AutoReconnect = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
